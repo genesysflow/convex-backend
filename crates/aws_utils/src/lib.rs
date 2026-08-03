@@ -50,6 +50,34 @@ static AWS_S3_DISABLE_RANGE_PREFETCH: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
+static AWS_S3_REQUIRE_UNIFORM_PART_SIZES: LazyLock<bool> = LazyLock::new(|| {
+    env::var("AWS_S3_REQUIRE_UNIFORM_PART_SIZES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            S3_ENDPOINT_URL
+                .as_deref()
+                .is_some_and(is_cloudflare_r2_endpoint)
+        })
+});
+
+fn is_cloudflare_r2_endpoint(endpoint: &str) -> bool {
+    let authority = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, remainder)| remainder)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let hostname = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, hostname)| hostname)
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    hostname == "r2.cloudflarestorage.com" || hostname.ends_with(".r2.cloudflarestorage.com")
+}
+
 /// Similar aws_config::from_env but returns an error if credentials or
 /// region is are not. It also doesn't spew out log lines every time
 /// credentials are accessed.
@@ -149,4 +177,34 @@ pub fn are_checksums_disabled() -> bool {
 /// set this to fall back to fetching object attributes before downloading.
 pub fn is_range_prefetch_disabled() -> bool {
     *AWS_S3_DISABLE_RANGE_PREFETCH
+}
+
+/// Returns true if multipart uploads must use equally sized non-trailing parts.
+///
+/// Cloudflare R2 requires this and is detected from its standard endpoint. The
+/// environment variable provides an override for custom or proxied endpoints.
+pub fn requires_uniform_part_sizes() -> bool {
+    *AWS_S3_REQUIRE_UNIFORM_PART_SIZES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cloudflare_r2_endpoint;
+
+    #[test]
+    fn recognizes_cloudflare_r2_endpoints() {
+        assert!(is_cloudflare_r2_endpoint(
+            "https://account-id.r2.cloudflarestorage.com"
+        ));
+        assert!(is_cloudflare_r2_endpoint(
+            "https://account-id.eu.r2.cloudflarestorage.com:443/bucket"
+        ));
+        assert!(is_cloudflare_r2_endpoint(
+            "HTTPS://ACCOUNT-ID.R2.CLOUDFLARESTORAGE.COM"
+        ));
+        assert!(!is_cloudflare_r2_endpoint("https://s3.amazonaws.com"));
+        assert!(!is_cloudflare_r2_endpoint(
+            "https://r2.cloudflarestorage.com.example.com"
+        ));
+    }
 }

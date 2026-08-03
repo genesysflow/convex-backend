@@ -1222,3 +1222,35 @@ impl Display for StorageUseCase {
         }
     }
 }
+
+#[cfg(test)]
+mod buffered_upload_tests {
+    use bytes::Bytes;
+
+    use super::BufferedUpload;
+
+    #[test]
+    fn fixed_size_upload_has_uniform_non_trailing_parts() {
+        let data = b"abcdefghijklmnopqrstuvwxyz123456789";
+        let mut buffer = Vec::new();
+        let mut target_part_size = 10;
+        let mut parts = vec![];
+        for chunk in data.chunks(7) {
+            if let Some(part) = BufferedUpload::_update_buffer_and_get_next(
+                &mut buffer,
+                &mut target_part_size,
+                10,
+                Bytes::copy_from_slice(chunk),
+            ) {
+                parts.push(part);
+            }
+        }
+        parts.push(buffer.into());
+
+        let joined_parts: Bytes = parts.iter().flat_map(|p| p.iter().copied()).collect();
+        assert_eq!(joined_parts, Bytes::from_static(data));
+        let lengths: Vec<_> = parts.iter().map(|p| p.len()).collect();
+        assert_eq!(lengths, vec![10, 10, 10, 5]);
+        assert!(lengths[..lengths.len() - 1].iter().all(|&len| len == 10));
+    }
+}

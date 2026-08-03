@@ -36,6 +36,7 @@ use aws_utils::{
     is_range_prefetch_disabled,
     is_sse_disabled,
     must_s3_config_from_env,
+    requires_uniform_part_sizes,
     s3::S3Client,
 };
 use bytes::Bytes;
@@ -98,9 +99,10 @@ pub const ACCESS_KEY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 pub const ACCESS_KEY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// The following are not knobs because they are fixed by S3.
-/// The part size we use starts at the min and doubles until the max,
-/// which allows very large files but still supports fast uploads for small
-/// files.
+/// On AWS S3, the part size starts at the min and doubles until the max, which
+/// allows very large files but still supports fast uploads for small files.
+/// Providers such as Cloudflare R2 require all non-trailing parts to be the
+/// same size, so they use the configured maximum as a fixed part size.
 /// S3 minimum part size for multipart upload is 5MiB
 const MIN_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 20);
 /// S3 maximum part size for multipart upload is 5GiB
@@ -286,13 +288,17 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
     #[fastrace::trace]
     async fn start_upload(&self) -> anyhow::Result<Box<BufferedUpload>> {
         let key: ObjectKey = self.runtime.new_uuid_v4().to_string().try_into()?;
+        let max_part_size = (*STORAGE_MAX_INTERMEDIATE_PART_SIZE)
+            .clamp(MIN_S3_INTERMEDIATE_PART_SIZE, MAX_S3_INTERMEDIATE_PART_SIZE);
+        let min_part_size = if requires_uniform_part_sizes() {
+            max_part_size
+        } else {
+            MIN_S3_INTERMEDIATE_PART_SIZE
+        };
         let upload = BufferedUpload::new(
             self.start_upload_with_key(key).await?,
-            MIN_S3_INTERMEDIATE_PART_SIZE,
-            std::cmp::min(
-                MAX_S3_INTERMEDIATE_PART_SIZE,
-                *STORAGE_MAX_INTERMEDIATE_PART_SIZE,
-            ),
+            min_part_size,
+            max_part_size,
         );
         Ok(Box::new(upload))
     }

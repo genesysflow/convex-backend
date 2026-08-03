@@ -1,0 +1,169 @@
+diff --git a/crates/aws_s3/src/storage.rs b/crates/aws_s3/src/storage.rs
+index 4375feede..8e92e2bfc 100644
+--- a/crates/aws_s3/src/storage.rs
++++ b/crates/aws_s3/src/storage.rs
+@@ -36,6 +36,7 @@ use aws_utils::{
+     is_range_prefetch_disabled,
+     is_sse_disabled,
+     must_s3_config_from_env,
++    requires_uniform_part_sizes,
+     s3::S3Client,
+ };
+ use bytes::Bytes;
+@@ -98,9 +99,10 @@ pub const ACCESS_KEY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+ pub const ACCESS_KEY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+ 
+ /// The following are not knobs because they are fixed by S3.
+-/// The part size we use starts at the min and doubles until the max,
+-/// which allows very large files but still supports fast uploads for small
+-/// files.
++/// On AWS S3, the part size starts at the min and doubles until the max, which
++/// allows very large files but still supports fast uploads for small files.
++/// Providers such as Cloudflare R2 require all non-trailing parts to be the
++/// same size, so they use the configured maximum as a fixed part size.
+ /// S3 minimum part size for multipart upload is 5MiB
+ const MIN_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 20);
+ /// S3 maximum part size for multipart upload is 5GiB
+@@ -286,13 +288,17 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
+     #[fastrace::trace]
+     async fn start_upload(&self) -> anyhow::Result<Box<BufferedUpload>> {
+         let key: ObjectKey = self.runtime.new_uuid_v4().to_string().try_into()?;
++        let max_part_size = (*STORAGE_MAX_INTERMEDIATE_PART_SIZE)
++            .clamp(MIN_S3_INTERMEDIATE_PART_SIZE, MAX_S3_INTERMEDIATE_PART_SIZE);
++        let min_part_size = if requires_uniform_part_sizes() {
++            max_part_size
++        } else {
++            MIN_S3_INTERMEDIATE_PART_SIZE
++        };
+         let upload = BufferedUpload::new(
+             self.start_upload_with_key(key).await?,
+-            MIN_S3_INTERMEDIATE_PART_SIZE,
+-            std::cmp::min(
+-                MAX_S3_INTERMEDIATE_PART_SIZE,
+-                *STORAGE_MAX_INTERMEDIATE_PART_SIZE,
+-            ),
++            min_part_size,
++            max_part_size,
+         );
+         Ok(Box::new(upload))
+     }
+@@ -865,4 +871,4 @@ pub fn s3_bucket_name(use_case: &StorageUseCase) -> anyhow::Result<String> {
+     ))
+ }
+ 
+-// Test below only works if you have AWS environment variables set
+\ No newline at end of file
++// Test below only works if you have AWS environment variables set
+diff --git a/crates/aws_utils/src/lib.rs b/crates/aws_utils/src/lib.rs
+index d0d9a2f9a..8f3b5f1c4 100644
+--- a/crates/aws_utils/src/lib.rs
++++ b/crates/aws_utils/src/lib.rs
+@@ -50,6 +50,34 @@ static AWS_S3_DISABLE_RANGE_PREFETCH: LazyLock<bool> = LazyLock::new(|| {
+         .unwrap_or_default()
+ });
+ 
++static AWS_S3_REQUIRE_UNIFORM_PART_SIZES: LazyLock<bool> = LazyLock::new(|| {
++    env::var("AWS_S3_REQUIRE_UNIFORM_PART_SIZES")
++        .ok()
++        .and_then(|s| s.parse().ok())
++        .unwrap_or_else(|| {
++            S3_ENDPOINT_URL
++                .as_deref()
++                .is_some_and(is_cloudflare_r2_endpoint)
++        })
++});
++
++fn is_cloudflare_r2_endpoint(endpoint: &str) -> bool {
++    let authority = endpoint
++        .split_once("://")
++        .map_or(endpoint, |(_, remainder)| remainder)
++        .split('/')
++        .next()
++        .unwrap_or_default();
++    let hostname = authority
++        .rsplit_once('@')
++        .map_or(authority, |(_, hostname)| hostname)
++        .split(':')
++        .next()
++        .unwrap_or_default()
++        .to_ascii_lowercase();
++    hostname == "r2.cloudflarestorage.com" || hostname.ends_with(".r2.cloudflarestorage.com")
++}
++
+ /// Similar aws_config::from_env but returns an error if credentials or
+ /// region is are not. It also doesn't spew out log lines every time
+ /// credentials are accessed.
+@@ -150,3 +178,33 @@ pub fn are_checksums_disabled() -> bool {
+ pub fn is_range_prefetch_disabled() -> bool {
+     *AWS_S3_DISABLE_RANGE_PREFETCH
+ }
++
++/// Returns true if multipart uploads must use equally sized non-trailing parts.
++///
++/// Cloudflare R2 requires this and is detected from its standard endpoint. The
++/// environment variable provides an override for custom or proxied endpoints.
++pub fn requires_uniform_part_sizes() -> bool {
++    *AWS_S3_REQUIRE_UNIFORM_PART_SIZES
++}
++
++#[cfg(test)]
++mod tests {
++    use super::is_cloudflare_r2_endpoint;
++
++    #[test]
++    fn recognizes_cloudflare_r2_endpoints() {
++        assert!(is_cloudflare_r2_endpoint(
++            "https://account-id.r2.cloudflarestorage.com"
++        ));
++        assert!(is_cloudflare_r2_endpoint(
++            "https://account-id.eu.r2.cloudflarestorage.com:443/bucket"
++        ));
++        assert!(is_cloudflare_r2_endpoint(
++            "HTTPS://ACCOUNT-ID.R2.CLOUDFLARESTORAGE.COM"
++        ));
++        assert!(!is_cloudflare_r2_endpoint("https://s3.amazonaws.com"));
++        assert!(!is_cloudflare_r2_endpoint(
++            "https://r2.cloudflarestorage.com.example.com"
++        ));
++    }
++}
+diff --git a/crates/storage/src/lib.rs b/crates/storage/src/lib.rs
+index 2c885dfaf..281379d43 100644
+--- a/crates/storage/src/lib.rs
++++ b/crates/storage/src/lib.rs
+@@ -1222,3 +1222,35 @@ impl Display for StorageUseCase {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod buffered_upload_tests {
++    use bytes::Bytes;
++
++    use super::BufferedUpload;
++
++    #[test]
++    fn fixed_size_upload_has_uniform_non_trailing_parts() {
++        let data = b"abcdefghijklmnopqrstuvwxyz123456789";
++        let mut buffer = Vec::new();
++        let mut target_part_size = 10;
++        let mut parts = vec![];
++        for chunk in data.chunks(7) {
++            if let Some(part) = BufferedUpload::_update_buffer_and_get_next(
++                &mut buffer,
++                &mut target_part_size,
++                10,
++                Bytes::copy_from_slice(chunk),
++            ) {
++                parts.push(part);
++            }
++        }
++        parts.push(buffer.into());
++
++        let joined_parts: Bytes = parts.iter().flat_map(|p| p.iter().copied()).collect();
++        assert_eq!(joined_parts, Bytes::from_static(data));
++        let lengths: Vec<_> = parts.iter().map(|p| p.len()).collect();
++        assert_eq!(lengths, vec![10, 10, 10, 5]);
++        assert!(lengths[..lengths.len() - 1].iter().all(|&len| len == 10));
++    }
++}

@@ -8,6 +8,8 @@ import {
   WrenchIcon,
 } from "@heroicons/react/24/outline";
 import { Button } from "@ui/Button";
+import { KEYCAP_CLASSES, KeyboardShortcut } from "@ui/KeyboardShortcut";
+import { Loading } from "@ui/Loading";
 import { Tooltip } from "@ui/Tooltip";
 import { cn } from "@ui/cn";
 import type { DeploymentType } from "@convex-dev/platform/managementApi";
@@ -23,6 +25,8 @@ import { useLastViewedDeploymentForProject } from "hooks/useLastViewed";
 import type { PlatformDeploymentResponse, ProjectDetails } from "generatedApi";
 import type { NavigationTarget } from "./navigation";
 import { REMOTE_VALUE_PREFIX } from "./navigation";
+import { useCopyAction } from "./copy";
+import type { DeploymentPicker } from "./picker";
 import { usePaletteAnalytics } from "./analytics";
 
 // Items whose default action is direct navigation drill into their nested
@@ -229,17 +233,37 @@ export function ActionItem({
   );
 }
 
-// Reports that palette content is loading. Renders nothing: the dialog shows
-// the spinner in the search input while any signal is mounted, instead of a
-// loading row inside the list.
+// Reports that palette content is loading.
 export const PaletteLoadingContext = React.createContext<
   (() => () => void) | null
 >(null);
 
-export function LoadingSignal() {
+export function LoadingSignal({ rows = 5 }: { rows?: number }) {
   const beginLoading = React.useContext(PaletteLoadingContext);
   React.useEffect(() => beginLoading?.(), [beginLoading]);
-  return null;
+  const id = React.useId();
+  return (
+    <>
+      {Array.from({ length: rows }, (_, index) => (
+        <Command.Item
+          key={index}
+          value={`${REMOTE_VALUE_PREFIX}loading:${id}:${index}`}
+          disabled
+          data-placeholder=""
+          aria-label="Loading result"
+        >
+          <Loading
+            fullHeight={false}
+            className="size-4.5 shrink-0 rounded-full"
+          />
+          <span className="flex min-w-0 grow flex-col gap-2.5">
+            <Loading fullHeight={false} className="h-3.5 w-2/3" />
+            <Loading fullHeight={false} className="h-3 w-1/3" />
+          </span>
+        </Command.Item>
+      ))}
+    </>
+  );
 }
 
 // Lets the active drill-in page publish a short status line into the palette
@@ -257,8 +281,8 @@ export function PinnedActions({ children }: { children: React.ReactNode }) {
     <Command.Group
       data-pinned=""
       className={cn(
-        "sticky bottom-0 z-20 -mx-2 border-t px-2 py-1",
-        "bg-background-secondary",
+        "sticky bottom-0 z-20 -mx-1 border-t p-1",
+        "bg-background-primary",
       )}
     >
       {children}
@@ -266,37 +290,47 @@ export function PinnedActions({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function CurrentBadge() {
-  return <span className="rounded-sm border px-1.5 py-0.5">Current</span>;
+export function CurrentBadge({ label = "Current" }: { label?: string }) {
+  return <span className="rounded-sm border px-1.5 py-0.5">{label}</span>;
 }
 
-export function DrillInHint({
-  kind,
-  onDrill,
-}: {
-  kind?: React.ReactNode;
-  onDrill?: () => void;
-}) {
+function ItemPrimary({ children }: { children: React.ReactNode }) {
+  return <span data-item-primary="">{children}</span>;
+}
+
+function DrillButton({ onDrill }: { onDrill: () => void }) {
+  return (
+    <Button
+      variant="unstyled"
+      aria-label="Browse"
+      tip={
+        <span className="flex items-center gap-1">
+          Browse
+          <KeyboardShortcut value={["Right"]} className={KEYCAP_CLASSES} />
+        </span>
+      }
+      data-secondary-action=""
+      className={cn(
+        "mr-1 ml-1.5 shrink-0 rounded-lg p-1.5 text-content-tertiary",
+        "hover:bg-background-secondary hover:text-content-primary",
+        "dark:hover:bg-background-tertiary",
+      )}
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onDrill();
+      }}
+    >
+      <CaretRightIcon className="size-4" />
+    </Button>
+  );
+}
+
+export function DrillInHint({ kind }: { kind?: React.ReactNode }) {
   return (
     <span className="ml-auto flex shrink-0 items-center gap-1 text-xs text-content-tertiary">
       {kind}
-      {onDrill ? (
-        <Button
-          variant="unstyled"
-          aria-label="Browse"
-          tip="Browse (⇧⏎)"
-          className="rounded-sm p-0.5 hover:bg-background-primary"
-          onClick={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            onDrill();
-          }}
-        >
-          <CaretRightIcon className="size-4" />
-        </Button>
-      ) : (
-        <CaretRightIcon className="size-4" />
-      )}
+      <CaretRightIcon className="size-4" />
     </span>
   );
 }
@@ -339,9 +373,11 @@ export function ProjectItem({
     : lastViewedDeployment
       ? generateHref(lastViewedDeployment)
       : defaultHref;
+  const value = `${REMOTE_VALUE_PREFIX}project:${project.id}`;
+  useCopyAction(value, { label: "slug", getText: () => project.slug });
   return (
     <Command.Item
-      value={`${REMOTE_VALUE_PREFIX}project:${project.id}`}
+      value={value}
       className="animate-fadeInFromLoading"
       onSelect={() => {
         trackSelected("switch-project");
@@ -351,20 +387,15 @@ export function ProjectItem({
         return onNavigate(projectHref);
       }}
     >
-      <StackIcon className="text-content-secondary" />
-      {/* Two lines: the project's name, then its slug. */}
-      <span className="flex min-w-0 flex-col">
-        <span className="truncate">
-          <HighlightedText text={project.name || project.slug} />
-        </span>
-        <span className="truncate text-xs text-content-tertiary">
-          <HighlightedText text={project.slug} />
-        </span>
-      </span>
-      <DrillInHint
-        kind={isCurrent ? <CurrentBadge /> : undefined}
-        onDrill={onDrill}
-      />
+      <ItemPrimary>
+        <ProjectRowBody project={project} />
+        {isCurrent && (
+          <span className="ml-auto shrink-0 text-xs text-content-tertiary">
+            <CurrentBadge />
+          </span>
+        )}
+      </ItemPrimary>
+      <DrillButton onDrill={onDrill} />
     </Command.Item>
   );
 }
@@ -394,12 +425,7 @@ export function DeploymentItem({
   const { project } = useProjectById(deployment.projectId);
   const projectSlug = knownProjectSlug ?? project?.slug;
   const typeLabel = deploymentTypeLabel(deployment.deploymentType);
-  // Local deployments have no cloud reference; show the device and port they're
-  // running on instead, matching the header's old deployment menu.
-  const primary =
-    deployment.kind === "cloud" ? deployment.reference : deployment.deviceName;
-  const secondary =
-    deployment.kind === "local" ? `Port ${deployment.port}` : deployment.name;
+  const { primary } = deploymentRowText(deployment);
   const { trackSelected } = usePaletteAnalytics();
   // When switching straight to another deployment, keep whatever subpage the
   // user is on (Data, Logs, a settings tab, …) instead of resetting to Health.
@@ -409,9 +435,16 @@ export function DeploymentItem({
       ? router.asPath.split(/[?#]/)[0].split("/").slice(5).join("/")
       : "";
   const isCurrent = router.query.deploymentName === deployment.name;
+  const value = `${remote ? REMOTE_VALUE_PREFIX : ""}deployment:${deployment.name}`;
+  useCopyAction(
+    value,
+    deployment.kind === "cloud"
+      ? { label: "deployment reference", getText: () => deployment.reference }
+      : { label: "deployment name", getText: () => deployment.name },
+  );
   return (
     <Command.Item
-      value={`${remote ? REMOTE_VALUE_PREFIX : ""}deployment:${deployment.name}`}
+      value={value}
       className="animate-fadeInFromLoading"
       keywords={remote ? undefined : [primary, deployment.name, typeLabel]}
       onSelect={() => {
@@ -423,6 +456,159 @@ export function DeploymentItem({
         return onNavigate(currentView ? `${base}/${currentView}` : base);
       }}
     >
+      <ItemPrimary>
+        <DeploymentRowBody deployment={deployment} />
+        {isCurrent && (
+          <span className="ml-auto shrink-0 text-xs text-content-tertiary">
+            <CurrentBadge />
+          </span>
+        )}
+      </ItemPrimary>
+      <DrillButton onDrill={onDrill} />
+    </Command.Item>
+  );
+}
+
+// A deployment row in picker mode: choosing it hands the deployment to the
+// picker rather than navigating to it.
+export function DeploymentPickerItem({
+  deployment,
+  picker,
+  onSelect,
+}: {
+  deployment: PlatformDeploymentResponse;
+  picker: DeploymentPicker;
+  onSelect: () => void;
+}) {
+  const { trackSelected } = usePaletteAnalytics();
+  const { primary, secondary } = deploymentRowText(deployment);
+  const typeLabel = deploymentTypeLabel(deployment.deploymentType);
+  const unavailableReason = picker.unavailableReason?.(deployment);
+  const isSelected = picker.selectedDeploymentName === deployment.name;
+  const value = `pick-deployment:${deployment.name}`;
+  useCopyAction(
+    value,
+    deployment.kind === "cloud"
+      ? { label: "deployment reference", getText: () => deployment.reference }
+      : null,
+  );
+  const body = (
+    <>
+      <DeploymentRowBody deployment={deployment} />
+      {isSelected && (
+        <span className="ml-auto shrink-0 text-xs text-content-tertiary">
+          <CurrentBadge label="Selected" />
+        </span>
+      )}
+    </>
+  );
+  return (
+    <Command.Item
+      // Not the `deployment:` value the switcher rows use: that marks a row as
+      // browsable, and a picked deployment has no nested view to browse into.
+      value={value}
+      className={cn(
+        "animate-fadeInFromLoading",
+        unavailableReason && "pointer-events-none",
+      )}
+      keywords={[primary, secondary, deployment.name, typeLabel]}
+      disabled={unavailableReason !== undefined}
+      onSelect={() => {
+        trackSelected("pick-deployment");
+        onSelect();
+      }}
+    >
+      {unavailableReason ? (
+        // A disabled item is pointer-events-none so cmdk ignores it; re-enable
+        // events on just the tooltip trigger so hovering the row still explains
+        // why it can't be picked.
+        <Tooltip
+          tip={unavailableReason}
+          side="top"
+          asChild
+          className="pointer-events-auto flex w-full items-center gap-2"
+        >
+          <span>{body}</span>
+        </Tooltip>
+      ) : (
+        body
+      )}
+    </Command.Item>
+  );
+}
+
+// A project row in picker mode: choosing it drills into that project's
+// deployments rather than navigating anywhere.
+export function ProjectPickerItem({
+  project,
+  selected,
+  onSelect,
+}: {
+  project: ProjectDetails;
+  // The project the picker currently points at.
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const { trackSelected } = usePaletteAnalytics();
+  const value = `${REMOTE_VALUE_PREFIX}project:${project.id}`;
+  useCopyAction(value, { label: "slug", getText: () => project.slug });
+  return (
+    <Command.Item
+      value={value}
+      className="animate-fadeInFromLoading"
+      onSelect={() => {
+        trackSelected("pick-project");
+        onSelect();
+      }}
+    >
+      <ProjectRowBody project={project} />
+      <DrillInHint
+        kind={selected ? <CurrentBadge label="Selected" /> : undefined}
+      />
+    </Command.Item>
+  );
+}
+
+// The stacked-projects icon, then the project's name over its slug.
+function ProjectRowBody({ project }: { project: ProjectDetails }) {
+  return (
+    <>
+      <StackIcon className="text-content-secondary" />
+      <span className="flex min-w-0 flex-col">
+        <span className="truncate">
+          <HighlightedText text={project.name || project.slug} />
+        </span>
+        <span className="truncate text-xs text-content-tertiary">
+          <HighlightedText text={project.slug} />
+        </span>
+      </span>
+    </>
+  );
+}
+
+// Local deployments have no cloud reference; show the device and port they're
+// running on instead, matching the header's old deployment menu.
+function deploymentRowText(deployment: PlatformDeploymentResponse) {
+  return {
+    primary:
+      deployment.kind === "cloud"
+        ? deployment.reference
+        : deployment.deviceName,
+    secondary:
+      deployment.kind === "local" ? `Port ${deployment.port}` : deployment.name,
+  };
+}
+
+// The type badge, then the deployment's reference (or device) over its name
+// (or port).
+function DeploymentRowBody({
+  deployment,
+}: {
+  deployment: PlatformDeploymentResponse;
+}) {
+  const { primary, secondary } = deploymentRowText(deployment);
+  return (
+    <>
       <div
         className={cn(
           "inline-flex shrink-0 items-center justify-center rounded-full p-1",
@@ -431,8 +617,6 @@ export function DeploymentItem({
       >
         <DeploymentTypeIcon deploymentType={deployment.deploymentType} />
       </div>
-      {/* Two lines: the deployment's reference (or device), then its name (or
-          port). */}
       <span className="flex min-w-0 flex-col">
         <span className="truncate">
           <HighlightedText text={primary} />
@@ -441,11 +625,7 @@ export function DeploymentItem({
           <HighlightedText text={secondary} />
         </span>
       </span>
-      <DrillInHint
-        kind={isCurrent ? <CurrentBadge /> : undefined}
-        onDrill={onDrill}
-      />
-    </Command.Item>
+    </>
   );
 }
 

@@ -1,5 +1,5 @@
 import { Meta, StoryObj } from "@storybook/nextjs";
-import { mocked } from "storybook/test";
+import { mocked, screen, userEvent } from "storybook/test";
 import { useEffect } from "react";
 import type { FunctionReturnType } from "convex/server";
 import type { Value } from "convex/values";
@@ -33,7 +33,7 @@ import type { PlatformDeploymentResponse } from "generatedApi";
 import {
   CommandPalette,
   useCommandPaletteAnchor,
-  useCommandPaletteInitialPage,
+  useCommandPaletteInitialPages,
   useCommandPaletteOpen,
 } from "./CommandPalette";
 
@@ -228,6 +228,34 @@ export const TeamLevel: Story = {
   },
 };
 
+export const SearchLoading: Story = {
+  parameters: InsideDeployment.parameters,
+  beforeEach: () => {
+    mocked(useCurrentProject).mockReturnValue(mockProject);
+    mocked(useCurrentDeployment).mockReturnValue(devDeployment);
+    const pending = {
+      isLoading: true,
+      isLoadingMore: false,
+      hasMore: false,
+      loadMore: () => {},
+      debouncedQuery: "",
+    };
+    mocked(useInfiniteProjects).mockReturnValue({
+      ...pending,
+      projects: [],
+      pageSize: 20,
+    });
+    mocked(useInfiniteDeployments).mockReturnValue({
+      ...pending,
+      deployments: [],
+      pageSize: 25,
+    });
+  },
+  play: async () => {
+    await userEvent.type(await screen.findByRole("combobox"), "checkout");
+  },
+};
+
 // --- Deployment menu (the header's deployment switcher) ----------------------
 
 // The deployment switcher in the header opens the palette anchored beneath its
@@ -238,16 +266,16 @@ export const TeamLevel: Story = {
 function DeploymentSwitcherMenu() {
   const [, setOpen] = useCommandPaletteOpen();
   const [, setAnchor] = useCommandPaletteAnchor();
-  const [, setInitialPage] = useCommandPaletteInitialPage();
+  const [, setInitialPages] = useCommandPaletteInitialPages();
   useEffect(() => {
-    setInitialPage({ type: "deployments", project: mockProject });
+    setInitialPages([{ type: "deployments", project: mockProject }]);
     setAnchor({ left: 16, top: 56, source: "deployment-switcher" });
     setOpen(true);
     return () => {
       setOpen(false);
       setAnchor(null);
     };
-  }, [setOpen, setAnchor, setInitialPage]);
+  }, [setOpen, setAnchor, setInitialPages]);
   return (
     <div className="h-screen bg-background-primary">
       <div className="flex h-14 items-center border-b bg-background-secondary px-4">

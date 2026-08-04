@@ -20,8 +20,8 @@ using [R2](https://www.cloudflare.com/developer-platform/products/r2/) or some
 other drop-in replacement compatible with the AWS S3 API.
 
 Cloudflare R2's standard `*.r2.cloudflarestorage.com` endpoints are detected
-automatically so multipart uploads use the uniform part sizes R2 requires. If
-R2 is accessed through a proxy or custom endpoint, also set
+automatically so multipart uploads use the uniform part sizes R2 requires. If R2
+is accessed through a proxy or custom endpoint, also set
 `AWS_S3_REQUIRE_UNIFORM_PART_SIZES=true`.
 
 Then run the backend!

@@ -7,9 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Upstream branch, tag, or commit to build"
+        description:
+          "Upstream branch, tag, or commit to build. Leave blank to use the
+          revision published as the official latest image."
         required: false
-        default: release
+        default: ""
         type: string
       force_rebuild:
         description: "Rebuild even if the upstream SHA tag already exists"
@@ -38,11 +40,38 @@ jobs:
           path: fork
           persist-credentials: false
 
-      - name: Check out upstream release
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Resolve upstream source
+        id: upstream
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || '' }}
+        run: |
+          if [[ -n "$UPSTREAM_REF" ]]; then
+            ref="$UPSTREAM_REF"
+            echo "Using manually selected upstream ref: $ref"
+          else
+            image="ghcr.io/get-convex/convex-backend:latest"
+            image_config="$(
+              docker buildx imagetools inspect "$image" \
+                --format '{{json (index .Image "linux/amd64")}}'
+            )"
+            ref="$(jq -er '.config.Labels["org.opencontainers.image.revision"]' \
+              <<< "$image_config")"
+            if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::The official latest image has an invalid revision label: $ref"
+              exit 1
+            fi
+            echo "Official latest image was built from: $ref"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out upstream source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           repository: get-convex/convex-backend
-          ref: ${{ inputs.upstream_ref || 'release' }}
+          ref: ${{ steps.upstream.outputs.ref }}
           fetch-depth: 1
           path: source
           persist-credentials: false
@@ -75,9 +104,6 @@ jobs:
           echo "sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
           echo "commit_timestamp=${commit_timestamp}" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4

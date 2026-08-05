@@ -3,6 +3,7 @@ import { Preview } from "@storybook/nextjs";
 
 import themeDecorator from "./themeDecorator";
 import { docsPageDecorator } from "./docsPageDecorator";
+import { commandPaletteDecorator } from "./commandPaletteDecorator";
 import { sb } from "storybook/test";
 
 // Register modules for mocking in stories
@@ -59,10 +60,13 @@ sb.mock(import("dashboard-common/src/lib/deploymentApi.ts"), {
 sb.mock(import("dashboard-common/src/lib/appMetrics.ts"), {
   spy: true,
 });
-sb.mock(import("dashboard-common/src/lib/deploymentContext.tsx"), {
-  spy: true,
-});
 sb.mock(import("dashboard/src/hooks/useStripe.ts"));
+// Do not mock dashboard-common/src/lib/deploymentContext.tsx: the mocked
+// namespace hands out copies of the React context objects it defines, so a
+// `<DeploymentInfoContext.Provider>` set up by a story or decorator is invisible
+// to that module's own consumers (PermissionsProvider then reads `undefined` and
+// every deployment page story fails to render). Stories that need a connected
+// deployment provide MaybeConnectedDeploymentContext instead.
 
 const preview: Preview = {
   initialGlobals: {
@@ -80,6 +84,7 @@ const preview: Preview = {
   },
 
   decorators: [
+    commandPaletteDecorator,
     docsPageDecorator,
     themeDecorator({
       themes: {

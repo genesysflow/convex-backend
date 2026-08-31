@@ -1,5 +1,5 @@
 diff --git a/crates/aws_s3/src/storage.rs b/crates/aws_s3/src/storage.rs
-index 4375feede..8e92e2bfc 100644
+index 4375feede..73788d5c4 100644
 --- a/crates/aws_s3/src/storage.rs
 +++ b/crates/aws_s3/src/storage.rs
 @@ -36,6 +36,7 @@ use aws_utils::{
@@ -24,7 +24,19 @@ index 4375feede..8e92e2bfc 100644
  /// S3 minimum part size for multipart upload is 5MiB
  const MIN_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 20);
  /// S3 maximum part size for multipart upload is 5GiB
-@@ -286,13 +288,17 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
+@@ -230,7 +232,10 @@ async fn s3_client() -> Result<Client, anyhow::Error> {
+                         .buffer_time(*AWS_S3_MIN_IDENTITY_VALIDITY)
+                         .build(),
+                 )
+-                .retry_config(RetryConfig::standard())
++                // R2 can transiently throttle writes with HTTP 429. Match the
++                // retry budget used by the shared S3 client so a short-lived
++                // throttle does not fail an entire function push.
++                .retry_config(RetryConfig::standard().with_max_attempts(6))
+                 .build();
+             anyhow::Ok(Client::from_conf(s3_config))
+         })
+@@ -286,13 +291,17 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
      #[fastrace::trace]
      async fn start_upload(&self) -> anyhow::Result<Box<BufferedUpload>> {
          let key: ObjectKey = self.runtime.new_uuid_v4().to_string().try_into()?;
@@ -47,7 +59,31 @@ index 4375feede..8e92e2bfc 100644
          );
          Ok(Box::new(upload))
      }
-@@ -865,4 +871,4 @@ pub fn s3_bucket_name(use_case: &StorageUseCase) -> anyhow::Result<String> {
+@@ -749,6 +758,14 @@ impl<RT: Runtime> Upload for S3Upload<RT> {
+         &'a mut self,
+         receiver: &mut Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send + 'a>>,
+     ) -> anyhow::Result<()> {
++        // R2 throttles concurrent writes to the same object key. Its fixed-size
++        // multipart mode therefore uploads parts serially, while AWS S3 keeps
++        // the existing parallelism.
++        let max_parallel_uploads = if requires_uniform_part_sizes() {
++            1
++        } else {
++            MAXIMUM_PARALLEL_UPLOADS
++        };
+         let mut uploaded_parts = receiver
+             .map(|result| {
+                 let size = match &result {
+@@ -760,7 +777,7 @@ impl<RT: Runtime> Upload for S3Upload<RT> {
+                     Err(e) => Either::Right(future::err(e)),
+                 }
+             })
+-            .buffer_unordered(MAXIMUM_PARALLEL_UPLOADS)
++            .buffer_unordered(max_parallel_uploads)
+             .try_collect::<Vec<_>>()
+             .await?;
+         self.uploaded_parts.append(&mut uploaded_parts);
+@@ -865,4 +882,4 @@ pub fn s3_bucket_name(use_case: &StorageUseCase) -> anyhow::Result<String> {
      ))
  }
  

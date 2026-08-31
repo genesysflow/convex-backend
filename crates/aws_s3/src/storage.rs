@@ -232,7 +232,10 @@ async fn s3_client() -> Result<Client, anyhow::Error> {
                         .buffer_time(*AWS_S3_MIN_IDENTITY_VALIDITY)
                         .build(),
                 )
-                .retry_config(RetryConfig::standard())
+                // R2 can transiently throttle writes with HTTP 429. Match the
+                // retry budget used by the shared S3 client so a short-lived
+                // throttle does not fail an entire function push.
+                .retry_config(RetryConfig::standard().with_max_attempts(6))
                 .build();
             anyhow::Ok(Client::from_conf(s3_config))
         })
@@ -755,6 +758,14 @@ impl<RT: Runtime> Upload for S3Upload<RT> {
         &'a mut self,
         receiver: &mut Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send + 'a>>,
     ) -> anyhow::Result<()> {
+        // R2 throttles concurrent writes to the same object key. Its fixed-size
+        // multipart mode therefore uploads parts serially, while AWS S3 keeps
+        // the existing parallelism.
+        let max_parallel_uploads = if requires_uniform_part_sizes() {
+            1
+        } else {
+            MAXIMUM_PARALLEL_UPLOADS
+        };
         let mut uploaded_parts = receiver
             .map(|result| {
                 let size = match &result {
@@ -766,7 +777,7 @@ impl<RT: Runtime> Upload for S3Upload<RT> {
                     Err(e) => Either::Right(future::err(e)),
                 }
             })
-            .buffer_unordered(MAXIMUM_PARALLEL_UPLOADS)
+            .buffer_unordered(max_parallel_uploads)
             .try_collect::<Vec<_>>()
             .await?;
         self.uploaded_parts.append(&mut uploaded_parts);

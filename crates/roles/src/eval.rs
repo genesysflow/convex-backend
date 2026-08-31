@@ -102,6 +102,7 @@ impl ResourceSegment {
             (ResourceSegment::Billing, ConcreteSegment::Billing) => true,
             (ResourceSegment::OauthApplication, ConcreteSegment::OauthApplication) => true,
             (ResourceSegment::Sso, ConcreteSegment::Sso) => true,
+            (ResourceSegment::DirectorySync, ConcreteSegment::DirectorySync) => true,
             (ResourceSegment::Integration, ConcreteSegment::Integration) => true,
             (
                 ResourceSegment::DefaultEnvironmentVariable,
@@ -253,6 +254,7 @@ pub fn deployment_op_action(op: DeploymentOp) -> Option<RoleStatementAction> {
         O::ViewUsageLimits => A::ViewUsageLimits,
         O::WriteUsageLimits => A::WriteUsageLimits,
         O::ViewUsage => A::ViewDeploymentUsage,
+        O::UseAiGateway => A::UseAiGateway,
         O::Unknown => return None,
     })
 }

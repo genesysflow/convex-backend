@@ -14,8 +14,9 @@ use common::{
     bootstrap_model::{
         index::{
             database_index::IndexedFields,
+            IndexConfig,
             IndexMetadata,
-            INDEX_TABLE,
+            TabletIndexMetadata,
         },
         schema::SchemaState,
         tables::{
@@ -33,6 +34,7 @@ use common::{
         PendingDocumentUpdate,
         ResolvedDocument,
     },
+    errors::report_error,
     identity::InertIdentity,
     index::{
         IndexKey,
@@ -43,8 +45,11 @@ use common::{
         IntervalSet,
     },
     knobs::{
+        PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED,
+        SEARCH_INDEX_SIZE_SOFT_LIMIT,
         TEXT_INDEX_SIZE_HARD_LIMIT,
         VECTOR_INDEX_SIZE_HARD_LIMIT,
+        VECTOR_INDEX_SIZE_SOFT_LIMIT,
     },
     query::{
         CursorPosition,
@@ -109,6 +114,7 @@ use value::{
 use crate::{
     bootstrap_model::{
         defaults::BootstrapTableIds,
+        next_persistence_index_id::NextPersistenceIndexIdModel,
         table::{
             NUM_RESERVED_LEGACY_TABLE_NUMBERS,
             NUM_RESERVED_SYSTEM_TABLE_NUMBERS,
@@ -132,6 +138,7 @@ use crate::{
     },
     reads::TransactionReadSet,
     schema_registry::SchemaRegistry,
+    search_flusher_wake::SearchFlusherWakeSignals,
     snapshot_manager::Snapshot,
     table_summary::table_summary_bootstrapping_error,
     token::Token,
@@ -261,6 +268,61 @@ impl<RT: Runtime> Transaction<RT> {
 
     pub fn virtual_system_mapping(&self) -> &VirtualSystemMapping {
         &self.virtual_system_mapping
+    }
+
+    pub(crate) async fn assign_missing_persistence_index_ids(&mut self) -> anyhow::Result<()> {
+        if !*PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED {
+            return Ok(());
+        }
+        let writes = self.writes.as_flat()?;
+        let mut missing_index_id_updates = Vec::new();
+        for id in writes.new_index_document_ids() {
+            let update = writes
+                .get(&id)
+                .expect("tracked index metadata insert must have a pending write");
+            let Some(new_document) = &update.new_document else {
+                unreachable!("tracked index metadata insert must have a new document")
+            };
+            let PendingDocument::Concrete(document) = new_document else {
+                anyhow::bail!("new index metadata must be concrete before commit")
+            };
+            let metadata = TabletIndexMetadata::from_document(document.clone())?;
+            if matches!(
+                &metadata.config,
+                IndexConfig::Database {
+                    persistence_index_id: None,
+                    ..
+                }
+            ) {
+                missing_index_id_updates.push((update.id, metadata));
+            }
+        }
+        if missing_index_id_updates.is_empty() {
+            return Ok(());
+        }
+        let persistence_index_ids = match NextPersistenceIndexIdModel::new(self)
+            .allocate(missing_index_id_updates.len())
+            .await
+        {
+            Ok(index_ids) => index_ids,
+            Err(mut err) => {
+                err = err.context("Failed to allocate persistence index IDs");
+                report_error(&mut err).await;
+                return Ok(());
+            },
+        };
+
+        for ((id, mut metadata), persistence_index_id) in missing_index_id_updates
+            .into_iter()
+            .zip(persistence_index_ids)
+        {
+            metadata.assign_persistence_index_id(persistence_index_id);
+
+            SystemMetadataModel::new_global(self)
+                .replace(id, metadata.into_value().try_into()?)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Checks both virtual tables and tables to get the table number to name
@@ -577,7 +639,7 @@ impl<RT: Runtime> Transaction<RT> {
         &mut self,
         id: ResolvedDocumentId,
         value: PatchValue,
-    ) -> anyhow::Result<ResolvedDocument> {
+    ) -> anyhow::Result<PendingDocument> {
         task::consume_budget().await;
 
         let table_name = self.table_mapping().tablet_name(id.tablet_id)?;
@@ -597,15 +659,15 @@ impl<RT: Runtime> Transaction<RT> {
         let new_body = value.apply(old_pending.clone().into_pending_value())?;
         let new_document = PendingDocument::new(id, old_document.creation_time(), new_body)?;
         if new_document == old_pending {
-            return Ok(old_document);
+            return Ok(old_pending);
         }
         let new_document_view = new_document.to_document_with_max_commit_ts()?.into_owned();
         SchemaModel::new(self, namespace)
             .enforce(&new_document_view)
             .await?;
 
-        self.apply_validated_write(id, Some((old_document, old_ts)), Some(new_document))?;
-        Ok(new_document_view)
+        self.apply_validated_write(id, Some((old_document, old_ts)), Some(new_document.clone()))?;
+        Ok(new_document)
     }
 
     /// The current revision of a document as a [`PendingDocument`]: the staged
@@ -635,7 +697,7 @@ impl<RT: Runtime> Transaction<RT> {
         &mut self,
         id: ResolvedDocumentId,
         value: impl Into<PendingValue> + Send,
-    ) -> anyhow::Result<ResolvedDocument> {
+    ) -> anyhow::Result<PendingDocument> {
         task::consume_budget().await;
 
         let table_name = self.table_mapping().tablet_name(id.tablet_id)?;
@@ -651,15 +713,15 @@ impl<RT: Runtime> Transaction<RT> {
         // Replace document.
         let new_document = PendingDocument::new(id, old_document.creation_time(), value.into())?;
         if new_document == self.old_pending_document(&old_document, old_ts)? {
-            return Ok(old_document);
+            return Ok(new_document);
         }
         let new_document_view = new_document.to_document_with_max_commit_ts()?.into_owned();
         SchemaModel::new(self, namespace)
             .enforce(&new_document_view)
             .await?;
 
-        self.apply_validated_write(id, Some((old_document, old_ts)), Some(new_document))?;
-        Ok(new_document_view)
+        self.apply_validated_write(id, Some((old_document, old_ts)), Some(new_document.clone()))?;
+        Ok(new_document)
     }
 
     #[convex_macro::instrument_future]
@@ -916,24 +978,19 @@ impl<RT: Runtime> Transaction<RT> {
                 .table_number_for_system_table(namespace, table_name, default_table_number)
                 .await?;
             let metadata = TableMetadata::new(namespace, table_name.clone(), table_number);
-            let table_doc_id = SystemMetadataModel::new_global(self)
+            SystemMetadataModel::new_global(self)
                 .insert(&TABLES_TABLE, metadata.try_into()?)
                 .await?;
-            let tablet_id = TabletId(table_doc_id.internal_id());
-
-            let by_id_index = IndexMetadata::new_enabled(
-                GenericIndexName::by_id(tablet_id),
-                IndexedFields::by_id(),
-            );
-            SystemMetadataModel::new_global(self)
-                .insert(&INDEX_TABLE, by_id_index.try_into()?)
+            let by_id = GenericIndexName::by_id(table_name.clone());
+            let by_id_index = IndexMetadata::new_enabled(by_id, IndexedFields::by_id());
+            IndexModel::new(self)
+                .add_system_index(namespace, by_id_index)
                 .await?;
-            let metadata = IndexMetadata::new_enabled(
-                GenericIndexName::by_creation_time(tablet_id),
-                IndexedFields::creation_time(),
-            );
-            SystemMetadataModel::new_global(self)
-                .insert(&INDEX_TABLE, metadata.try_into()?)
+            let by_creation_time = GenericIndexName::by_creation_time(table_name.clone());
+            let metadata =
+                IndexMetadata::new_enabled(by_creation_time, IndexedFields::creation_time());
+            IndexModel::new(self)
+                .add_system_index(namespace, metadata)
                 .await?;
             tracing::info!("Created system table: {table_name}");
         } else {
@@ -1418,6 +1475,7 @@ impl FinalTransaction {
     pub(crate) fn validate_memory_index_sizes(
         &self,
         base_snapshot: &Snapshot,
+        search_flusher_wake: &SearchFlusherWakeSignals,
     ) -> anyhow::Result<()> {
         #[allow(unused_mut)]
         let mut vector_size_limit = *VECTOR_INDEX_SIZE_HARD_LIMIT;
@@ -1428,14 +1486,27 @@ impl FinalTransaction {
             .coalesced_writes()
             .map(|update| update.id().tablet_id)
             .collect();
+        let text_index_sizes = base_snapshot.text_indexes.flushable_in_memory_index_sizes();
+        let vector_index_sizes = base_snapshot
+            .vector_indexes
+            .flushable_in_memory_index_sizes();
+        // Wake the flushers before validating so that an index that's already
+        // over the hard limit still gets flushed.
+        search_flusher_wake.update_index_sizes(
+            SearchType::Text,
+            text_index_sizes.iter().cloned(),
+            *SEARCH_INDEX_SIZE_SOFT_LIMIT,
+        );
+        search_flusher_wake.update_index_sizes(
+            SearchType::Vector,
+            vector_index_sizes.iter().cloned(),
+            *VECTOR_INDEX_SIZE_SOFT_LIMIT,
+        );
         Self::validate_memory_index_size(
             &self.table_mapping,
             base_snapshot,
             &modified_tables,
-            base_snapshot
-                .text_indexes
-                .flushable_in_memory_index_sizes()
-                .into_iter(),
+            text_index_sizes.into_iter(),
             search_size_limit,
             SearchType::Text,
         )?;
@@ -1443,10 +1514,7 @@ impl FinalTransaction {
             &self.table_mapping,
             base_snapshot,
             &modified_tables,
-            base_snapshot
-                .vector_indexes
-                .flushable_in_memory_index_sizes()
-                .into_iter(),
+            vector_index_sizes.into_iter(),
             vector_size_limit,
             SearchType::Vector,
         )?;

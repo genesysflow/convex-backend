@@ -1850,6 +1850,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid team name or deployment region"
+          },
           "403": {
             "description": "Caller is not authorized to create teams"
           }
@@ -2042,6 +2045,10 @@
                 "sso:enable",
                 "sso:disable",
                 "sso:update",
+                "directorySync:enable",
+                "directorySync:disable",
+                "directorySync:updateGroupMapping",
+                "directorySync:deleteGroupMapping",
                 "deployment:transfer",
                 "deployment:receive",
                 "deployment:update",
@@ -2381,9 +2388,6 @@
             "PAT": []
           },
           {
-            "OAuth Team Token": []
-          },
-          {
             "Team Token": []
           }
         ]
@@ -2444,9 +2448,6 @@
             "PAT": []
           },
           {
-            "OAuth Team Token": []
-          },
-          {
             "Team Token": []
           }
         ]
@@ -2498,9 +2499,6 @@
             "PAT": []
           },
           {
-            "OAuth Team Token": []
-          },
-          {
             "Team Token": []
           }
         ]
@@ -2543,9 +2541,6 @@
         "security": [
           {
             "PAT": []
-          },
-          {
-            "OAuth Team Token": []
           },
           {
             "Team Token": []
@@ -2794,6 +2789,10 @@
               "sso:enable",
               "sso:disable",
               "sso:update",
+              "directorySync:enable",
+              "directorySync:disable",
+              "directorySync:updateGroupMapping",
+              "directorySync:deleteGroupMapping",
               "deployment:transfer",
               "deployment:receive",
               "deployment:update",
@@ -4483,6 +4482,11 @@
           "sso:disable",
           "sso:update",
           "sso:view",
+          "directorySync:enable",
+          "directorySync:disable",
+          "directorySync:updateGroupMapping",
+          "directorySync:deleteGroupMapping",
+          "directorySync:view",
           "customRole:view",
           "integration:view",
           "integration:create",
@@ -4506,7 +4510,8 @@
           "deployment:auditLog:view",
           "deployment:usageLimits:view",
           "deployment:usageLimits:write",
-          "deployment:usage:view"
+          "deployment:usage:view",
+          "deployment:aiGateway:use"
         ]
       },
       "RoleStatementActions": {
@@ -4626,6 +4631,13 @@
               "$ref": "#/components/schemas/TeamMemberCustomRole"
             },
             "description": "The custom roles attached to this team member. Present iff\n`role` is `custom`."
+          },
+          "dsyncSuspended": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present only on directory-sync teams. `true` means the member's IdP\naccount is suspended."
           }
         }
       },

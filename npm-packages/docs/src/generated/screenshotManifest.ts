@@ -653,6 +653,19 @@ export const screenshots = [
     }
   },
   {
+    "storyTitle": "docs/pages/project/deployment/settings/Backups",
+    "light": {
+      "filename": "pages_project_deployment_settings_backups_light.webp",
+      "width": 2560,
+      "height": 1440
+    },
+    "dark": {
+      "filename": "pages_project_deployment_settings_backups_dark.webp",
+      "width": 2560,
+      "height": 1440
+    }
+  },
+  {
     "storyTitle": "docs/pages/project/deployment/settings/EnvironmentVariables",
     "light": {
       "filename": "pages_project_deployment_settings_environment_variables_light.webp",
@@ -767,6 +780,19 @@ export const screenshots = [
       "filename": "pages_project_deployment_settings_usage_limits_empty_dark.webp",
       "width": 3024,
       "height": 2440
+    }
+  },
+  {
+    "storyTitle": "docs/pages/TeamUsage#AI Gateway",
+    "light": {
+      "filename": "pages_team_usage_ai_gateway_light.webp",
+      "width": 1667,
+      "height": 854
+    },
+    "dark": {
+      "filename": "pages_team_usage_ai_gateway_dark.webp",
+      "width": 1667,
+      "height": 854
     }
   }
 ] as const;

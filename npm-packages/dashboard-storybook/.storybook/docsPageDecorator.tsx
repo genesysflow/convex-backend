@@ -203,6 +203,7 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
     customDomainsEnabled: true,
     customRolesEnabled: false,
     deploymentClassSelectionEnabled: false,
+    directorySyncEnabled: false,
     logStreamingEnabled: true,
     managementApiEnabled: true,
     maxChefTokens: 50_000_000,
@@ -355,10 +356,6 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
   mocked(useLaunchDarkly).mockReturnValue({
     ...flagDefaults,
     enableStatuspageWidget: false,
-    // The schema page has shipped in the docs, so the docs screenshots should
-    // always show the Schema tab in the deployment sidebar. Individual stories
-    // can still override this through `docsPage.launchDarkly`.
-    schemaPage: true,
     ...docsPageParams?.launchDarkly,
   });
   mocked(useCurrentDeployment).mockReturnValue(

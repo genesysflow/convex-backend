@@ -106,6 +106,23 @@ impl TryFrom<Vec<IntervalProto>> for IntervalSet {
     }
 }
 
+impl IntoIterator for IntervalSet {
+    type Item = Interval;
+
+    type IntoIter = impl Iterator<Item = Interval>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::All => Either::Left(iter::once(Interval::all())),
+            Self::Intervals(intervals) => Either::Right(
+                intervals
+                    .into_iter()
+                    .map(|(start, end)| Interval { start, end }),
+            ),
+        }
+    }
+}
+
 impl IntervalSet {
     /// Construct an empty set.
     pub fn new() -> Self {
@@ -194,6 +211,10 @@ impl IntervalSet {
                             }
                         }
                     }
+                }
+                if merged_interval == Interval::all() {
+                    *self = IntervalSet::All;
+                    return;
                 }
                 cursor
                     .insert_after(merged_interval.start, merged_interval.end)

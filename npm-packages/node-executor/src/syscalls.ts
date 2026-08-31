@@ -166,6 +166,15 @@ const storageGetSchema = z.object({
   version: z.string(),
 });
 
+const createServiceTokenSchema = z.object({
+  service: z.literal("ai-gateway"),
+  version: z.string(),
+});
+
+const createServiceTokenReturn = z.object({
+  token: z.string(),
+});
+
 export type ScheduledJob = z.infer<typeof scheduleSchema>;
 
 export interface Syscalls {
@@ -224,6 +233,11 @@ export class SyscallsImpl {
   // can't surface as an `unhandledRejection` attributed to the next,
   // unrelated invocation that reuses this process.
   abortController: AbortController;
+
+  // Per-action: this instance is created once per invocation. Concurrent first
+  // calls share the in-flight promise; a rejected mint is dropped so a later
+  // call retries.
+  aiGatewayTokenPromise?: Promise<string>;
 
   constructor(
     udfPath: UdfPath,
@@ -499,6 +513,9 @@ export class SyscallsImpl {
         case "1.0/actions/action": {
           return JSON.stringify(await this.syscallAction(jsonArgs));
         }
+        case "1.0/createServiceToken": {
+          return JSON.stringify(await this.syscallCreateServiceToken(jsonArgs));
+        }
         case "1.0/actions/vectorSearch": {
           return JSON.stringify(await this.syscallVectorSearch(jsonArgs));
         }
@@ -735,6 +752,32 @@ export class SyscallsImpl {
         throw new Error(actionResult.errorMessage);
       default:
         throw new Error(`Invalid response: ${JSON.stringify(actionResult)}`);
+    }
+  }
+
+  async syscallCreateServiceToken(rawArgs: string): Promise<string> {
+    const operationName = "create service token";
+    const args = this.validateArgs(
+      rawArgs,
+      createServiceTokenSchema,
+      operationName,
+      false,
+    );
+    const pending = (this.aiGatewayTokenPromise ??= this.actionCallback({
+      version: args.version,
+      body: {},
+      path: "/api/actions/create_service_token",
+      operationName,
+      responseValidator: createServiceTokenReturn,
+      retryTransient: true,
+    }).then(({ token }) => token));
+    try {
+      return await pending;
+    } catch (e) {
+      if (this.aiGatewayTokenPromise === pending) {
+        this.aiGatewayTokenPromise = undefined;
+      }
+      throw e;
     }
   }
 

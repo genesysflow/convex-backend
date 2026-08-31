@@ -860,6 +860,34 @@
         }
       }
     },
+    "/local_deployments/{deployment_name}/auth": {
+      "get": {
+        "operationId": "get_local_deployment_auth_dashboard",
+        "parameters": [
+          {
+            "name": "deployment_name",
+            "in": "path",
+            "description": "",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalDeploymentAuthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/teams/{team_id}/get_project_roles": {
       "get": {
         "operationId": "get_project_roles_for_team",
@@ -2873,6 +2901,168 @@
         }
       }
     },
+    "/teams/{team_id}/directory_sync/portal_link": {
+      "post": {
+        "operationId": "generate_directory_sync_configuration_link",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerateDirectorySyncConfigurationLinkResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/directory_sync/groups": {
+      "get": {
+        "operationId": "list_directory_sync_groups",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListDirectorySyncGroupsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/teams/{team_id}/directory_sync/mappings/{workos_group_id}": {
+      "put": {
+        "operationId": "put_group_role_mapping",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          },
+          {
+            "name": "workos_group_id",
+            "in": "path",
+            "description": "WorkOS group ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGroupRoleMappingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_group_role_mapping",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TeamId"
+            }
+          },
+          {
+            "name": "workos_group_id",
+            "in": "path",
+            "description": "WorkOS group ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/member/directory_sync_offers": {
+      "get": {
+        "operationId": "list_directory_sync_offers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectorySyncOffersResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/member/directory_sync/join": {
+      "post": {
+        "operationId": "join_directory_synced_team",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JoinDirectorySyncedTeamRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinDirectorySyncedTeamResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/vercel/potential_teams": {
       "get": {
         "operationId": "list_potential_vercel_teams_dashboard",
@@ -3089,6 +3279,10 @@
           "enableSSO",
           "disableSSO",
           "updateSSO",
+          "enableDirectorySync",
+          "disableDirectorySync",
+          "updateDirectorySyncGroupMapping",
+          "deleteDirectorySyncGroupMapping",
           "transferDeployment",
           "receiveDeployment",
           "updateDeployment",
@@ -3959,6 +4153,69 @@
       "DeviceName": {
         "type": "string"
       },
+      "DirectoryGroupResponse": {
+        "type": "object",
+        "required": [
+          "workosGroupId",
+          "name",
+          "idpId"
+        ],
+        "properties": {
+          "workosGroupId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "idpId": {
+            "type": "string"
+          },
+          "mapping": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GroupRoleMappingResponse"
+              }
+            ]
+          }
+        }
+      },
+      "DirectorySyncOffer": {
+        "type": "object",
+        "required": [
+          "teamId",
+          "teamName",
+          "email"
+        ],
+        "properties": {
+          "teamId": {
+            "$ref": "#/components/schemas/TeamId"
+          },
+          "teamName": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "description": "The verified email of the caller that matched the roster row."
+          }
+        }
+      },
+      "DirectorySyncOffersResponse": {
+        "type": "object",
+        "required": [
+          "offers"
+        ],
+        "properties": {
+          "offers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DirectorySyncOffer"
+            }
+          }
+        }
+      },
       "DisconnectWorkOSTeamRequest": {
         "type": "object",
         "required": [
@@ -4092,6 +4349,17 @@
       },
       "EnableSSORequest": {
         "type": "object"
+      },
+      "GenerateDirectorySyncConfigurationLinkResponse": {
+        "type": "object",
+        "required": [
+          "link"
+        ],
+        "properties": {
+          "link": {
+            "type": "string"
+          }
+        }
       },
       "GenerateSSOConfigurationLinkRequest": {
         "type": "object",
@@ -4283,6 +4551,23 @@
           },
           "planType": {
             "type": "string"
+          }
+        }
+      },
+      "GroupRoleMappingResponse": {
+        "type": "object",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "customRoleIds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CustomRoleId"
+            }
           }
         }
       },
@@ -4498,6 +4783,46 @@
         "type": "boolean",
         "description": "Indicates whether the deployment is the default prod deployment for the\nproject, or the default cloud dev deployment for the member in the project."
       },
+      "JoinDirectorySyncedTeamRequest": {
+        "type": "object",
+        "required": [
+          "proposedTeamId"
+        ],
+        "properties": {
+          "proposedTeamId": {
+            "$ref": "#/components/schemas/TeamId"
+          }
+        }
+      },
+      "JoinDirectorySyncedTeamResponse": {
+        "type": "object",
+        "required": [
+          "teamId",
+          "teamSlug"
+        ],
+        "properties": {
+          "teamId": {
+            "$ref": "#/components/schemas/TeamId"
+          },
+          "teamSlug": {
+            "type": "string"
+          }
+        }
+      },
+      "ListDirectorySyncGroupsResponse": {
+        "type": "object",
+        "required": [
+          "groups"
+        ],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DirectoryGroupResponse"
+            }
+          }
+        }
+      },
       "ListMyCustomRolesResponse": {
         "type": "object",
         "required": [
@@ -4514,6 +4839,21 @@
             "items": {
               "$ref": "#/components/schemas/CustomRoleResponse"
             }
+          }
+        }
+      },
+      "LocalDeploymentAuthResponse": {
+        "type": "object",
+        "required": [
+          "adminKey",
+          "deploymentUrl"
+        ],
+        "properties": {
+          "adminKey": {
+            "$ref": "#/components/schemas/AdminKey"
+          },
+          "deploymentUrl": {
+            "type": "string"
           }
         }
       },
@@ -5620,6 +5960,11 @@
           "sso:disable",
           "sso:update",
           "sso:view",
+          "directorySync:enable",
+          "directorySync:disable",
+          "directorySync:updateGroupMapping",
+          "directorySync:deleteGroupMapping",
+          "directorySync:view",
           "customRole:view",
           "integration:view",
           "integration:create",
@@ -5643,7 +5988,8 @@
           "deployment:auditLog:view",
           "deployment:usageLimits:view",
           "deployment:usageLimits:write",
-          "deployment:usage:view"
+          "deployment:usage:view",
+          "deployment:aiGateway:use"
         ]
       },
       "RoleStatementActions": {
@@ -5736,6 +6082,33 @@
         "type": "string",
         "description": "ConvexAccessToken is our own internal notion of authorization.\nIt is versioned.\n\nV1 - uses an WorkOS access token for authorization.\n\nSerialization is done by SerializedAccessToken::new\nThe ConvexAccessToken is serialized (json) and base64\nencoded for obfuscation before sending it to the client\n\nDeserialization is done by SerializedAccessToken::decode\nThis reverses the process and returns a ConvexAccessToken which\ncan be match'd by the extractor.\n\n`SerializedAccessToken` is intentionally the only struct that is\nleft public.\n\nThe json is externally tagged. Expect it to look like\n{\"v1\": \"workostoken\"}"
       },
+      "SetGroupRoleMappingRequest": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "Built-in role. Mutually exclusive with `customRoles`."
+              }
+            ]
+          },
+          "customRoles": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/CustomRoleId"
+            },
+            "description": "Custom role IDs. If provided, must be non-empty. Mutually exclusive with\n`role`."
+          }
+        },
+        "additionalProperties": false
+      },
       "SetSpendingLimitArgs": {
         "type": "object",
         "properties": {
@@ -5807,10 +6180,12 @@
           "teamMaxVectorStorage",
           "teamMaxVectorBandwidth",
           "customDomainsEnabled",
+          "maxCustomDomains",
           "periodicBackupsEnabled",
           "maxCloudBackups",
           "maxChefTokens",
           "ssoEnabled",
+          "directorySyncEnabled",
           "auditLogRetentionDays",
           "maxDeployments",
           "managementApiEnabled",
@@ -5875,6 +6250,10 @@
           "customDomainsEnabled": {
             "type": "boolean"
           },
+          "maxCustomDomains": {
+            "type": "integer",
+            "format": "int64"
+          },
           "periodicBackupsEnabled": {
             "type": "boolean"
           },
@@ -5889,6 +6268,9 @@
             "minimum": 0
           },
           "ssoEnabled": {
+            "type": "boolean"
+          },
+          "directorySyncEnabled": {
             "type": "boolean"
           },
           "auditLogRetentionDays": {

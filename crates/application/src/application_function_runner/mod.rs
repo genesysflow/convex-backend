@@ -68,7 +68,9 @@ use common::{
     },
     types::{
         AllowedVisibility,
-        DeploymentId,
+        AttributedCaller,
+        AttributionClaims,
+        DeploymentMetadata,
         FunctionCaller,
         ModuleEnvironment,
         NodeDependency,
@@ -111,10 +113,7 @@ use model::{
     backend_info::BackendInfoModel,
     backend_state::BackendStateModel,
     components::handles::FunctionHandlesModel,
-    config::{
-        module_loader::ModuleLoader,
-        types::ModuleConfig,
-    },
+    config::types::ModuleConfig,
     environment_variables::{
         types::{
             EnvVarName,
@@ -213,6 +212,7 @@ use self::metrics::{
     UdfExecutorResult,
 };
 use crate::{
+    ai_gateway_jwt::AiGatewayJwtMinter,
     application_function_runner::metrics::{
         function_run_timer,
         function_total_timer,
@@ -229,7 +229,7 @@ use crate::{
         FunctionExecutionLog,
         OutstandingFunctionState,
     },
-    llm_gateway_jwt::LlmGatewayJwtMinter,
+    source_map_cache::SourceMapCache,
     ActionError,
     ActionReturn,
     MutationError,
@@ -664,8 +664,8 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     // Used for analyze, schema, etc.
     node_actions: NodeActions<RT>,
 
-    pub(crate) module_cache: Arc<dyn ModuleLoader<RT>>,
-    modules_storage: Arc<dyn Storage>,
+    source_map_cache: SourceMapCache<RT>,
+    pub(crate) modules_storage: Arc<dyn Storage>,
     file_storage: TransactionalFileStorage<RT>,
 
     function_log: FunctionExecutionLog<RT>,
@@ -674,11 +674,8 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     cache_manager: CacheManager<RT>,
     default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
     node_action_limiter: Limiter<RT>,
-    llm_gateway_jwt_minter: Option<Arc<dyn LlmGatewayJwtMinter>>,
-    /// A deployment keeps its ID for as long as it stays loaded, and one
-    /// `Application` serves one deployment, so token minting reuses the first
-    /// read instead of opening a transaction per call.
-    deployment_id: tokio::sync::OnceCell<DeploymentId>,
+    ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
+    deployment: DeploymentMetadata,
 }
 
 impl<RT: Runtime> ApplicationFunctionRunner<RT> {
@@ -690,12 +687,13 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         node_actions: NodeActions<RT>,
         file_storage: TransactionalFileStorage<RT>,
         modules_storage: Arc<dyn Storage>,
-        module_cache: Arc<dyn ModuleLoader<RT>>,
+        source_map_cache: SourceMapCache<RT>,
         function_log: FunctionExecutionLog<RT>,
         audit_log_client: AuditLogClient,
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         cache: QueryCache,
-        llm_gateway_jwt_minter: Option<Arc<dyn LlmGatewayJwtMinter>>,
+        ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
+        deployment: DeploymentMetadata,
     ) -> Self {
         let isolate_functions = FunctionRouter::new(
             function_runner,
@@ -727,7 +725,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             key_broker,
             isolate_functions,
             node_actions,
-            module_cache,
+            source_map_cache,
             modules_storage,
             file_storage,
             function_log,
@@ -735,9 +733,42 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             cache_manager,
             default_system_env_vars,
             node_action_limiter,
-            llm_gateway_jwt_minter,
-            deployment_id: tokio::sync::OnceCell::new(),
+            ai_gateway_jwt_minter,
+            deployment,
         }
+    }
+
+    /// Called with a typed caller via [`ActionCallbacks`], or with flat
+    /// claims from Conductor's gRPC handler.
+    pub async fn mint_ai_gateway_jwt(
+        &self,
+        _identity: &Identity,
+        attribution: AttributionClaims,
+    ) -> anyhow::Result<String> {
+        let mut tx = self.database.begin_system().await?;
+        let ai_gateway_disabled = BackendInfoModel::new(&mut tx)
+            .get()
+            .await?
+            .and_then(|backend_info| backend_info.ai_gateway_disabled)
+            .unwrap_or(false);
+        if ai_gateway_disabled {
+            anyhow::bail!(ErrorMetadata::forbidden(
+                "AiGatewayDisabled",
+                "The Convex AI gateway is not enabled for your team. Upgrade to a paid plan to \
+                 enable it, or contact support@convex.dev if you believe this is an error."
+            ));
+        }
+        let Some(minter) = self.ai_gateway_jwt_minter.as_ref() else {
+            // `bad_request` shows this message to the developer; a bare
+            // anyhow error would show a generic internal error instead.
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "AiGatewayUnavailable",
+                "`getServiceToken(\"ai-gateway\")` isn't available on this deployment because the \
+                 AI gateway is a Convex Cloud service. Deploy to Convex Cloud, or call your model \
+                 provider directly with your own API key."
+            ));
+        };
+        minter.mint(&self.deployment, attribution)
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
@@ -1456,12 +1487,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     .await?
                     .context("no source package?")?;
                 let source_maps_callback = async {
-                    let module_version = self
-                        .module_cache
-                        .get_module_with_metadata(&module, &source_package)
-                        .await?;
                     let mut source_maps = BTreeMap::new();
-                    if let Some(source_map) = module_version.source_map.clone() {
+                    if let Some(source_map) = self
+                        .source_map_cache
+                        .get_source_map(
+                            &self.deployment.name,
+                            &self.modules_storage,
+                            &module,
+                            &source_package,
+                        )
+                        .await?
+                    {
                         source_maps.insert(path.udf_path.module().clone(), source_map);
                     }
                     Ok(source_maps)
@@ -2068,28 +2104,13 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
 #[async_trait]
 impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
     #[fastrace::trace]
-    async fn issue_llm_gateway_jwt(&self) -> anyhow::Result<String> {
-        let backend_deployment_id = match self.deployment_id.get() {
-            Some(deployment_id) => Some(*deployment_id),
-            None => {
-                let mut tx = self.database.begin_system().await?;
-                let deployment_id = BackendInfoModel::new(&mut tx)
-                    .get()
-                    .await?
-                    .map(|backend_info| backend_info.deployment);
-                if let Some(deployment_id) = deployment_id {
-                    // Backend info can arrive after the first call, so only a real
-                    // ID is worth remembering. Concurrent callers race here and
-                    // read back the same value.
-                    let _ = self.deployment_id.set(deployment_id);
-                }
-                deployment_id
-            },
-        };
-        self.llm_gateway_jwt_minter
-            .as_ref()
-            .context("LLM gateway JWT minting is not configured")?
-            .mint(backend_deployment_id)
+    async fn create_ai_gateway_token(
+        &self,
+        identity: Identity,
+        caller: AttributedCaller,
+    ) -> anyhow::Result<String> {
+        self.mint_ai_gateway_jwt(&identity, AttributionClaims::from(caller))
+            .await
     }
 
     #[fastrace::trace]

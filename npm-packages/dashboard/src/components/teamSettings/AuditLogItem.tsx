@@ -623,6 +623,41 @@ function EntryAction({
     case "sso:update": {
       return <span>updated SSO settings</span>;
     }
+    case "directorySync:enable": {
+      return <span>enabled directory sync</span>;
+    }
+    case "directorySync:disable": {
+      return <span>disabled directory sync</span>;
+    }
+    case "directorySync:updateGroupMapping": {
+      const groupId =
+        metadata.current?.workosGroupId ?? metadata.previous?.workosGroupId;
+      return (
+        <span>
+          updated directory sync group role mapping
+          {groupId && (
+            <>
+              {" for group "}
+              <span className="font-semibold">{groupId}</span>
+            </>
+          )}
+        </span>
+      );
+    }
+    case "directorySync:deleteGroupMapping": {
+      const groupId = metadata.previous?.workosGroupId;
+      return (
+        <span>
+          removed directory sync group role mapping
+          {groupId && (
+            <>
+              {" for group "}
+              <span className="font-semibold">{groupId}</span>
+            </>
+          )}
+        </span>
+      );
+    }
     case "integration:workos:projectEnvironment:create": {
       return <span>created a project WorkOS environment</span>;
     }
@@ -885,6 +920,9 @@ function AuditLogItemActor({
 }
 
 function deploymentDisplayName(deployment: PlatformDeploymentResponse) {
+  if (deployment.kind === "cloud") {
+    return `${deployment.reference}`;
+  }
   switch (deployment.deploymentType) {
     case "prod":
       return "a production deployment";
@@ -940,7 +978,7 @@ function DeploymentSettingsLink({
       >
         {deploymentDisplayName(deployment)}
       </Link>
-      <span> of {project.name}</span>
+      <span> in {project.name}</span>
     </>
   );
 }

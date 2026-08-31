@@ -21,6 +21,7 @@ use application::{
     log_visibility::RedactLogsToClient,
     Application,
     QueryCache,
+    SourceMapCache,
 };
 use common::{
     self,
@@ -79,6 +80,7 @@ use search::{
     SegmentTermMetadataFetcher,
 };
 use serde::Serialize;
+pub use sync::subscription_reconnect::SubscriptionReconnectRateLimiter;
 
 pub mod admin;
 mod app_metrics;
@@ -142,6 +144,7 @@ impl LocalAppState {
 pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
     pub runtime: ProdRuntime,
+    pub subscription_reconnect_rate_limiter: Option<Arc<SubscriptionReconnectRateLimiter>>,
 }
 
 #[derive(Serialize)]
@@ -173,6 +176,7 @@ pub async fn make_app(
             Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
         )),
         deleted_tablet_sender,
+        config.name(),
     )
     .await?;
     initialize_application_system_tables(&database).await?;
@@ -273,6 +277,7 @@ pub async fn make_app(
         deleted_tablet_receiver,
         oidc_http_client,
         None,
+        SourceMapCache::new(runtime.clone()),
     )
     .await?;
 

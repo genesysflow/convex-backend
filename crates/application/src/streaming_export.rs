@@ -82,7 +82,7 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
     ) -> anyhow::Result<SyncResult> {
         let result = streaming_export::data_sync(
-            &self.database,
+            &self.database.latest_database_snapshot()?,
             identity.clone(),
             cursor,
             StreamingExportFilter {
@@ -95,6 +95,29 @@ impl<RT: Runtime> Application<RT> {
         self.record_data_sync_progress(&result, identity, &request_metadata)
             .await?;
         Ok(result)
+    }
+
+    /// Mint a data sync cursor equivalent to a legacy `document_deltas` cursor,
+    /// letting a consumer switch protocols without re-reading its data.
+    #[fastrace::trace]
+    pub async fn data_sync_cursor_from_deltas(
+        &self,
+        identity: Identity,
+        cursor: Timestamp,
+        selection: StreamingExportSelection,
+        sync_client: DataSyncClient,
+    ) -> anyhow::Result<SyncCursor> {
+        streaming_export::data_sync_cursor_from_deltas(
+            &self.database.latest_database_snapshot()?,
+            identity,
+            cursor,
+            StreamingExportFilter {
+                selection,
+                ..Default::default()
+            },
+            sync_client,
+        )
+        .await
     }
 
     /// One page of the progress rows of active data syncs — those that
@@ -129,6 +152,20 @@ impl<RT: Runtime> Application<RT> {
             .await?;
         let next_cursor = next_cursor.map(|cursor| self.key_broker().encrypt_cursor(&cursor));
         Ok((syncs, next_cursor))
+    }
+
+    /// The progress row of a single active data sync — one that fetched a page
+    /// within the active window — or `None` if no such sync exists.
+    pub async fn active_data_sync(
+        &self,
+        identity: Identity,
+        sync_id: &str,
+    ) -> anyhow::Result<Option<DataSyncProgressMetadata>> {
+        let now_ms = self.runtime.unix_timestamp().as_ms_since_epoch()?;
+        let mut tx = self.begin(identity).await?;
+        DataSyncProgressModel::new(&mut tx)
+            .active_sync(now_ms, sync_id)
+            .await
     }
 
     /// Upsert this sync's `_data_sync_progress` row from the page's outcome.

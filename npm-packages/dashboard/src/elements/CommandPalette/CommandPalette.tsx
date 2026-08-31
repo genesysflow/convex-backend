@@ -29,10 +29,11 @@ import { Footer } from "./Footer";
 import { NoResultsMessage } from "./NoResultsMessage";
 import { AskAIQueryItem, RootCommands } from "./RootCommands";
 import {
-  SearchResultDetail,
-  SearchResultDetailItem,
-} from "./DeploymentSearchCommands";
-import { SwitchProjectCommands } from "./searchGroups";
+  DocumentSearchResult,
+  DocumentSearchResultItem,
+} from "./DocumentSearchResult";
+import { useDrillStack } from "./useDrillStack";
+import { SwitchProjectCommands, TeamDeploymentsCommands } from "./searchGroups";
 import { ThemeCommands } from "./ThemeCommands";
 import { TeamsCommands } from "./TeamsCommands";
 import { handlePaletteKeyDown } from "./keyboard";
@@ -99,7 +100,7 @@ export function CommandPalette() {
   const [, setPicker] = useCommandPaletteDeploymentPicker();
   const router = useRouter();
 
-  const [detail, setDetail] = useState<SearchResultDetailItem | null>(null);
+  const [detail, setDetail] = useState<DocumentSearchResultItem | null>(null);
   const { trackOpened } = usePaletteAnalytics();
 
   // Closing always clears any trigger anchor and picker so the next
@@ -175,7 +176,7 @@ export function CommandPalette() {
         </ErrorBoundary>
       )}
       {detail && (
-        <SearchResultDetail
+        <DocumentSearchResult
           detail={detail}
           onClose={() => setDetail(null)}
           onNavigate={(to) => {
@@ -193,27 +194,42 @@ function CommandPaletteDialog({
   onOpenDetail,
 }: {
   onClose: () => void;
-  onOpenDetail: (detail: SearchResultDetailItem) => void;
+  onOpenDetail: (detail: DocumentSearchResultItem) => void;
 }) {
   const router = useRouter();
   const team = useCurrentTeam();
   const project = useCurrentProject();
-  const [search, setSearch] = useState("");
+  // Switching submenus (drilling in/out, or jumping via breadcrumbs) can move
+  // focus onto the clicked row or breadcrumb. The search input stays mounted
+  // across page changes, so returning focus to it keeps the user typing.
+  const inputRef = useRef<HTMLInputElement>(null);
+  // cmdk only ever scrolls the selected row into view, so a list left scrolled
+  // down stays there through whatever replaces its contents.
+  const listRef = useRef<HTMLDivElement>(null);
+  const scrollListToTop = useCallback(() => {
+    if (listRef.current) {
+      listRef.current.scrollTop = 0;
+    }
+  }, []);
+  const afterNavigate = useCallback(() => {
+    scrollListToTop();
+    inputRef.current?.focus();
+  }, [scrollListToTop]);
+
   // "Drilling" is stepping into a nested view of the palette rather than
   // navigating away (e.g. from the root into a team's list of projects, or
-  // from a project into its deployments). Each drill pushes a page onto this
-  // stack and clears the search.
+  // from a project into its deployments).
   const [initialPages, setInitialPages] = useCommandPaletteInitialPages();
   const [anchor] = useCommandPaletteAnchor();
   const [picker] = useCommandPaletteDeploymentPicker();
-  const [pages, setPages] = useState<PalettePage[]>(initialPages ?? []);
+  const { pages, search, setSearch, pushPage, popPage, goToDepth, resetTo } =
+    useDrillStack({ initialPages: initialPages ?? [], afterNavigate });
   useEffect(() => {
     if (initialPages) {
-      setPages(initialPages);
-      setSearch("");
+      resetTo(initialPages);
       setInitialPages(null);
     }
-  }, [initialPages, setInitialPages]);
+  }, [initialPages, setInitialPages, resetTo]);
   // `drillPage` is the view currently shown
   const drillPage = pages[pages.length - 1];
   const placeholder = palettePlaceholder(drillPage, team?.name, project?.name);
@@ -278,49 +294,6 @@ function CommandPaletteDialog({
     return () => setLoadingCount((count) => count - 1);
   }, []);
   const isSearchPending = loadingCount > 0;
-
-  // Switching submenus (drilling in/out, or jumping via breadcrumbs) can move
-  // focus onto the clicked row or breadcrumb. The search input stays mounted
-  // across page changes, so returning focus to it keeps the user typing.
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  // cmdk only ever scrolls the selected row into view, so a list left scrolled
-  // down stays there through whatever replaces its contents.
-  const listRef = useRef<HTMLDivElement>(null);
-  const scrollListToTop = useCallback(() => {
-    if (listRef.current) {
-      listRef.current.scrollTop = 0;
-    }
-  }, []);
-
-  const pushPage = useCallback(
-    (newPage: PalettePage) => {
-      setPages((current) => [...current, newPage]);
-      setSearch("");
-      scrollListToTop();
-      inputRef.current?.focus();
-    },
-    [scrollListToTop],
-  );
-
-  const popPage = useCallback(() => {
-    setPages((current) => current.slice(0, -1));
-    setSearch("");
-    scrollListToTop();
-    inputRef.current?.focus();
-  }, [scrollListToTop]);
-
-  // Jump back to a given depth in the drill-in stack via the breadcrumbs: 0
-  // returns to the root, n keeps the first n pages.
-  const goToDepth = useCallback(
-    (depth: number) => {
-      setPages((current) => current.slice(0, depth));
-      setSearch("");
-      scrollListToTop();
-      inputRef.current?.focus();
-    },
-    [scrollListToTop],
-  );
 
   const onNavigate = useCallback(
     (to: NavigationDestination) => {
@@ -526,6 +499,13 @@ function CommandPaletteDialog({
                           projectSlug: drillPage.project.slug,
                         })
                       }
+                    />
+                  )}
+                  {drillPage?.type === "teamDeployments" && (
+                    <TeamDeploymentsCommands
+                      search={search}
+                      onNavigate={onNavigate}
+                      pushPage={pushPage}
                     />
                   )}
                   {drillPage?.type === "deployment" && (

@@ -100,7 +100,8 @@ use crate::{
             },
         },
         AsyncOpRequest,
-        IsolateEnvironment,
+        JsEnvironment,
+        SyscallProvider,
     },
     execution_scope::ExecutionScope,
     helpers::{
@@ -137,7 +138,7 @@ pub struct AnalyzeEnvironment {
     collected_logs: VecDeque<String>,
 }
 
-impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
+impl<RT: Runtime> SyscallProvider<RT> for AnalyzeEnvironment {
     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         // These logs are only shown to the pusher on error.
         let log_message = messages.join(" ");
@@ -213,12 +214,21 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
             )),
         }
     }
+}
+
+impl<RT: Runtime> JsEnvironment<RT> for AnalyzeEnvironment {
+    type AsyncResolver = v8::Global<v8::PromiseResolver>;
+    type SyscallProvider = Self;
+
+    fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+        self
+    }
 
     fn start_async_syscall(
         &mut self,
         name: String,
         _args: JsonValue,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringImport", syscall_name_for_error(&name)),
@@ -232,7 +242,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringImport", request.name_for_error()),
@@ -309,7 +319,7 @@ impl AnalyzeEnvironment {
         drop(timeout);
 
         // Suppress the original error if the isolate was forcibly terminated.
-        if let Err(e) = handle.take_termination_error(None, "analyze")? {
+        if let Err(e) = handle.take_termination_error("analyze")? {
             return Ok(Err(e));
         }
 

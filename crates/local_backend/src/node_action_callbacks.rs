@@ -38,11 +38,13 @@ use common::{
     knobs::V8_ACTION_USER_TIMEOUT,
     runtime::UnixTimestamp,
     types::{
+        AttributionClaims,
         FunctionCaller,
         QueryInvocation,
         SessionId,
         SessionRequestSeqNumber,
         UdfIdentifier,
+        UdfType,
     },
     RequestContext,
     RequestId,
@@ -111,15 +113,33 @@ pub struct MutationIdentifierJson {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LlmGatewayJwtResponse {
+pub struct CreateServiceTokenResponse {
     pub token: String,
 }
 
-pub async fn issue_llm_gateway_jwt(
+pub async fn create_service_token(
     MtState(st): MtState<LocalAppState>,
+    ExtractActionIdentity {
+        identity,
+        component_id,
+    }: ExtractActionIdentity,
+    ExtractActionName(action_name): ExtractActionName,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    let token = st.application.issue_llm_gateway_jwt().await?;
-    Ok(Json(LlmGatewayJwtResponse { token }))
+    let mut tx = st.application.begin(identity.clone()).await?;
+    let component_path = tx.must_component_path(component_id)?;
+    let attribution = match action_name {
+        Some(name) => AttributionClaims {
+            component_path: component_path.serialize(),
+            function_name: Some(name),
+            function_type: Some(UdfType::Action.to_lowercase_string().to_owned()),
+        },
+        None => AttributionClaims::unknown(),
+    };
+    let token = st
+        .application
+        .mint_ai_gateway_jwt(&identity, attribution)
+        .await?;
+    Ok(Json(CreateServiceTokenResponse { token }))
 }
 
 impl TryFrom<MutationIdentifierJson> for SessionRequestIdentifier {

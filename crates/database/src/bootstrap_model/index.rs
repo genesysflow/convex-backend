@@ -61,7 +61,6 @@ use value::{
 };
 
 use crate::{
-    bootstrap_model::index_backfills::IndexBackfillModel,
     patch_value,
     query::TableFilter,
     reads::TransactionReadSet,
@@ -356,9 +355,6 @@ impl<'a, RT: Runtime> IndexModel<'a, RT> {
     ) -> anyhow::Result<()> {
         for index in indexes {
             self.enable_index(&index).await?;
-            IndexBackfillModel::new(self.tx)
-                .delete_index_backfill(index.id())
-                .await?;
         }
         Ok(())
     }
@@ -373,10 +369,12 @@ impl<'a, RT: Runtime> IndexModel<'a, RT> {
             IndexConfig::Database {
                 spec,
                 on_disk_state,
+                persistence_index_id,
             } => match on_disk_state {
                 DatabaseIndexState::Enabled => IndexConfig::Database {
                     spec,
                     on_disk_state: DatabaseIndexState::Backfilled { staged: true },
+                    persistence_index_id,
                 },
                 _ => {
                     anyhow::bail!("Index is not enabled, so it cannot be disabled");

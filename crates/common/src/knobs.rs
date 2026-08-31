@@ -166,6 +166,12 @@ pub static APP_METRICS_SEED_STARTUP_JITTER: LazyLock<Duration> = LazyLock::new(|
 pub static KILL_APP_METRICS_SEED_WORKER: LazyLock<bool> =
     LazyLock::new(|| env_config("KILL_APP_METRICS_SEED_WORKER", false));
 
+/// Minimum spacing between a deployment's deploy reports to big brain. Deploys
+/// landing within this window of the previous report coalesce into a single
+/// request carrying the newest deploy time.
+pub static DEPLOY_REPORT_MIN_INTERVAL: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("DEPLOY_REPORT_MIN_INTERVAL_SECS", 2)));
+
 /// Databricks query id (UUID) for the conductor app-metrics seed query, which
 /// takes a comma-separated `instance_names` parameter and returns rolled up
 /// usage data. Defaults to the the empty string, which means the worker will be
@@ -199,6 +205,10 @@ pub static V8_ACTION_USER_TIMEOUT: LazyLock<Duration> =
 /// the docs.
 pub static NODE_ACTION_USER_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("NODE_ACTION_USER_TIMEOUT_SECS", 600)));
+
+/// Upper bound for user action execution across the V8 and Node runtimes.
+pub static MAX_ACTION_USER_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| max(*V8_ACTION_USER_TIMEOUT, *NODE_ACTION_USER_TIMEOUT));
 
 /// Ideally, we should have no timeout here but we are relying on defense in
 /// depth in case somehow the upstream get stuck. Use very high timeout here.
@@ -360,6 +370,38 @@ pub static TRANSACTION_MAX_NUM_USER_WRITES: LazyLock<usize> =
 pub static TRANSACTION_MAX_USER_WRITE_SIZE_BYTES: LazyLock<usize> = LazyLock::new(|| {
     env_config("TRANSACTION_MAX_USER_WRITE_SIZE_BYTES", 1 << 24) // 16 MiB
 });
+
+/// Soft cap on document rows the committer combines into one batched
+/// persistence write.
+pub static COMMITTER_MAX_WRITE_BATCH_DOCUMENTS: LazyLock<usize> =
+    LazyLock::new(|| env_config("COMMITTER_MAX_WRITE_BATCH_DOCUMENTS", 64));
+
+/// Soft cap on the serialized bytes of one batched persistence write.
+pub static COMMITTER_MAX_WRITE_BATCH_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    env_config("COMMITTER_MAX_WRITE_BATCH_BYTES", 1 << 16) // 64 KiB
+});
+
+/// How long the committer holds a partially-filled write batch open for commits
+/// that are still arriving, once batching engages.
+pub static COMMITTER_MAX_COMMIT_DELAY: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_millis(env_config("COMMITTER_MAX_COMMIT_DELAY_MS", 1)));
+
+/// How many batched persistence writes the committer keeps in flight at once.
+pub static COMMITTER_MAX_CONCURRENT_WRITE_BATCHES: LazyLock<usize> =
+    LazyLock::new(|| env_config::<usize>("COMMITTER_MAX_CONCURRENT_WRITE_BATCHES", 16).max(1));
+
+/// How many persistence writes must be in flight, counting the one about to
+/// start, before the committer combines commits into batches.
+pub static COMMITTER_BATCH_WRITE_THRESHOLD: LazyLock<usize> =
+    LazyLock::new(|| env_config("COMMITTER_BATCH_WRITE_THRESHOLD", 3));
+
+/// How many pre-validation batches the committer keeps in flight at once.
+pub static COMMITTER_MAX_CONCURRENT_PRE_VALIDATIONS: LazyLock<usize> =
+    LazyLock::new(|| env_config::<usize>("COMMITTER_MAX_CONCURRENT_PRE_VALIDATIONS", 32).max(1));
+
+/// Most commits conflict-checked together in one pre-validation batch.
+pub static COMMITTER_MAX_PRE_VALIDATE_BATCH_SIZE: LazyLock<usize> =
+    LazyLock::new(|| env_config::<usize>("COMMITTER_MAX_PRE_VALIDATE_BATCH_SIZE", 1).max(1));
 
 /// SnapshotManager maintains a bounded time range of versions,
 /// determined by `MAX_TRANSACTION_WINDOW`, allowing the `Database` layer to
@@ -911,12 +953,11 @@ pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
 pub static COMMITTER_QUEUE_SIZE: LazyLock<usize> =
     LazyLock::new(|| env_config("COMMITTER_QUEUE_SIZE", 128));
 
-/// Maximum number of commits that may be between starting their persistence
-/// write and publishing (i.e. in the committer's `persistence_writes`
-/// pipeline). At this cap, the committer pauses admitting messages, so backlog
-/// accumulates in the bounded committer queue instead of inside the database.
-pub static COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES: LazyLock<usize> =
-    LazyLock::new(|| env_config("COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES", 256));
+/// Maximum number of commits that are concurrently being processed by the
+/// committer. This includes prevalidation, on-thread validation, writing to the
+/// database, and publishing the commit.
+pub static COMMITTER_MAX_CONCURRENT_COMMITS: LazyLock<usize> =
+    LazyLock::new(|| env_config("COMMITTER_MAX_CONCURRENT_COMMITS", 512));
 
 /// 0 -> default (number of cores)
 pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS", 0));
@@ -1211,14 +1252,19 @@ pub static DATABASE_USE_PREPARED_STATEMENTS: LazyLock<bool> =
 pub static ARCHIVE_FETCH_TIMEOUT_SECONDS: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("ARCHIVE_FETCH_TIMEOUT_SECONDS", 150)));
 
-/// The total number of modules across all versions that will be held in memory
-/// at once.
-pub static MODULE_CACHE_MAX_SIZE_BYTES: LazyLock<u64> =
-    LazyLock::new(|| env_config("MODULE_CACHE_MAX_SIZE_BYTES", 100_000_000));
+/// The total size of source maps, across all deployments and module versions,
+/// that will be held in memory at once.
+pub static SOURCE_MAP_CACHE_MAX_SIZE_BYTES: LazyLock<u64> =
+    LazyLock::new(|| env_config("SOURCE_MAP_CACHE_MAX_SIZE_BYTES", 100_000_000));
 
-/// The maximum number of concurrent module fetches we'll allow.
-pub static MODULE_CACHE_MAX_CONCURRENCY: LazyLock<usize> =
-    LazyLock::new(|| env_config("MODULE_CACHE_MAX_CONCURRENCY", 10));
+/// The maximum number of concurrent source package fetches we'll allow when
+/// filling the source map cache.
+pub static SOURCE_MAP_CACHE_MAX_CONCURRENCY: LazyLock<usize> =
+    LazyLock::new(|| env_config("SOURCE_MAP_CACHE_MAX_CONCURRENCY", 200));
+
+/// The maximum number of queued source map cache requests.
+pub static SOURCE_MAP_CACHE_QUEUE_SIZE: LazyLock<usize> =
+    LazyLock::new(|| env_config("SOURCE_MAP_CACHE_QUEUE_SIZE", 400));
 
 /// The maximum size of the in memory index cache in Funrun in bytes.
 pub static FUNRUN_INDEX_CACHE_SIZE: LazyLock<u64> =
@@ -1304,6 +1350,10 @@ pub static SEARCHLIGHT_CLUSTER_NAME: LazyLock<String> = LazyLock::new(|| {
 /// ticketmaster, ticketmaster-staging, etc.)
 pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
     LazyLock::new(|| env_config("TICKETMASTER_CLUSTER_NAME", String::from("ticketmaster")));
+
+/// Timeout applied to each individual probe request the prober makes.
+pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("PROBER_PROBE_TIMEOUT", 30)));
 
 /// The maximum number of CPU cores that can be used simultaneously by the
 /// isolates. Zero means no limit.
@@ -1410,6 +1460,21 @@ pub static BACKEND_USAGE_FIREHOSE_NAME: LazyLock<Option<String>> = LazyLock::new
     }
 });
 
+/// Firehose stream for AI gateway usage rows, landing at
+/// `s3://cvx-data-lake-prod/ai_usage/`. Its own stream, not the backend usage
+/// one, so AI ingest lag can't stall usage metering. Empty turns emit off.
+pub static AI_GATEWAY_USAGE_FIREHOSE: LazyLock<Option<String>> = LazyLock::new(|| {
+    let result = env_config(
+        "AI_GATEWAY_USAGE_FIREHOSE",
+        prod_override("", "cvx-firehose-ai_usage-prod").to_string(),
+    );
+    if !result.is_empty() {
+        Some(result)
+    } else {
+        None
+    }
+});
+
 /// If usage tracking worker takes longer than this, trace details to logs.
 pub static USAGE_TRACKING_WORKER_SLOW_TRACE_THRESHOLD: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config(
@@ -1417,6 +1482,14 @@ pub static USAGE_TRACKING_WORKER_SLOW_TRACE_THRESHOLD: LazyLock<Duration> = Lazy
         120,
     ))
 });
+
+/// How many `_file_storage` documents the deployment must hold before the
+/// usage gauges' file storage total resumes from its previous sync rather than
+/// syncing the storage tables again. Resuming catches up along the document
+/// log, which reads every table's revisions in the timestamp range, not just
+/// `_file_storage`'s, so below this many documents a fresh sync is cheaper.
+pub static FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME: LazyLock<i64> =
+    LazyLock::new(|| env_config("FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME", 4096));
 
 /// The number of events we can accumulate in the buffer that's used to send
 /// events from our business logic to our firehose client.
@@ -1593,6 +1666,13 @@ pub static MAX_ECHO_BYTES: LazyLock<usize> =
 pub static MAX_USER_MODULES: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_USER_MODULES", 4096));
 
+/// The limit, in bytes, on the zipped size of a deployment's source packages
+/// (user modules plus external node dependencies).
+///
+/// Conductor will build a zip of this size in memory during code push.
+pub static MAX_ZIPPED_PACKAGES_SIZE: LazyLock<usize> =
+    LazyLock::new(|| env_config("MAX_ZIPPED_PACKAGES_SIZE", 90_000_000));
+
 /// Percentage of request traces that should sampled.
 ///
 /// Sampling config is a JSON object with the following format:
@@ -1623,7 +1703,7 @@ pub static REQUEST_TRACE_SAMPLE_CONFIG: LazyLock<SamplingConfig> = LazyLock::new
         "REQUEST_TRACE_SAMPLE_CONFIG",
         prod_override(
             SamplingConfig::default(),
-            r#"{"defaultFraction":0.00001,"routeOverrides":[{"routeRegexp":"/api/push_config","fraction":0.1}, {"routeRegexp":"conductor/load-instance","fraction":0.01}, {"routeRegexp":"usage_tracking_worker/send_usage","fraction":0.01}]}"#
+            r#"{"defaultFraction":0.00001,"routeOverrides":[{"routeRegexp":"/api/push_config","fraction":0.1}, {"routeRegexp":"conductor/load-instance","fraction":0.01}, {"routeRegexp":"usage_tracking_worker/send_usage","fraction":0.01}, {"routeRegexp":"commit","fraction":0.01}]}"#
                 .parse()
                 .unwrap(),
         ),
@@ -1665,10 +1745,10 @@ pub static USHER_SERVICE_CACHE_MAX_ENTRIES: LazyLock<u64> =
     LazyLock::new(|| env_config("USHER_SERVICE_CACHE_MAX_ENTRIES", 1000));
 
 /// Usher cache for instance -> partition lookups.
-/// Arbitrarily chosen cache size. From metrics, a single Usher processes
-/// requests for about 250 unique instances in a 10 minute period.
+/// The five-minute idle expiry bounds idle memory, while the higher capacity
+/// leaves headroom for the per-host working set without size-based churn.
 pub static USHER_PARTITION_CACHE_MAX_ENTRIES: LazyLock<u64> =
-    LazyLock::new(|| env_config("USHER_PARTITION_CACHE_MAX_ENTRIES", 1000));
+    LazyLock::new(|| env_config("USHER_PARTITION_CACHE_MAX_ENTRIES", 100_000));
 
 /// Initial backoff duration when retrying a query in the sync worker.
 pub static SYNC_WORKER_QUERY_RETRY_INITIAL_BACKOFF_MS: LazyLock<Duration> = LazyLock::new(|| {
@@ -1733,7 +1813,7 @@ pub static STORAGE_MAX_INTERMEDIATE_PART_SIZE: LazyLock<usize> =
 /// Minimum number of milliseconds a commit needs to take to send traces to
 /// honeycomb.
 pub static COMMIT_TRACE_THRESHOLD: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_millis(env_config("COMMIT_TRACE_THRESHOLD", 500)));
+    LazyLock::new(|| Duration::from_millis(env_config("COMMIT_TRACE_THRESHOLD", 200)));
 
 /// How many instances a Conductor will try to simultaneously load (on startup,
 /// or when it discovers new instances) Going too high means that the Conductor
@@ -1924,6 +2004,13 @@ pub static INITIAL_PERSISTENCE_WRITES_BACKOFF: LazyLock<Duration> = LazyLock::ne
 pub static MAX_PERSISTENCE_WRITES_BACKOFF: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_millis(env_config("MAX_PERSISTENCE_WRITES_BACKOFF_MS", 10 * 1000))
 });
+
+/// Whether newly created database indexes receive persistence IDs.
+///
+/// The allocator's high-water mark remains durable while allocation is
+/// disabled.
+pub static PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED", true));
 
 /// HTTP/2 keepalive PING interval for proxied reqwest clients. Without
 /// keepalive a connection the peer drops without a TCP FIN/RST (e.g. a

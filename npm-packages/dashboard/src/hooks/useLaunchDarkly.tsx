@@ -5,16 +5,18 @@ export const flagDefaults: {
   commandPaletteDeleteProjects: boolean;
   enableNewDashboardVersionNotification: boolean;
   connectionStateCheckIntervalMs: number;
-  usageLimits: boolean;
   nonDefaultTeamDevsInMainMenu: number;
-  copyEnvVarNameAndValue: boolean;
+  showAiGatewayUsage: boolean;
+  ephemeralZipExportToken: boolean;
+  directorySync: boolean;
 } = {
   commandPaletteDeleteProjects: false,
   enableNewDashboardVersionNotification: false,
   connectionStateCheckIntervalMs: 2500,
-  usageLimits: false,
   nonDefaultTeamDevsInMainMenu: 10,
-  copyEnvVarNameAndValue: false,
+  showAiGatewayUsage: false,
+  ephemeralZipExportToken: false,
+  directorySync: false,
 };
 
 export const flagDefaultsKebabCase = Object.entries(flagDefaults).reduce(

@@ -37,8 +37,9 @@ use itertools::Itertools as _;
 
 use crate::{
     array_buffer_allocator::ArrayBufferMemoryLimit,
+    client::SharedIsolateHeapStats,
     context_cache::ContextCache,
-    environment::IsolateEnvironment,
+    environment::V8IsolateEnvironment,
     helpers::pump_message_loop,
     metrics::{
         create_isolate_timer,
@@ -50,9 +51,10 @@ use crate::{
     request_scope::RequestState,
     strings,
     termination::{
-        IsolateHandle,
+        ExecutionHandle,
         IsolateTerminationReason,
     },
+    timeout::start_request_on_handle,
     ConcurrencyPermit,
     Timeout,
 };
@@ -66,7 +68,7 @@ pub const SETUP_URL: &str = "convex:/_system/setup.js";
 pub struct Isolate<RT: Runtime> {
     rt: RT,
     v8_isolate: ManuallyDrop<v8::OwnedIsolate>,
-    handle: IsolateHandle,
+    handle: ExecutionHandle,
     // Typically, the user timeout is configured based on environment. This
     // allows us to set an upper bound to it that we use for tests.
     max_user_timeout: Option<Duration>,
@@ -187,7 +189,7 @@ impl<RT: Runtime> Isolate<RT> {
 
         v8_isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
-        let handle = IsolateHandle::new(v8_isolate.thread_safe_handle());
+        let handle = ExecutionHandle::new(v8_isolate.thread_safe_handle());
 
         // Pass ownership of the HeapContext struct to the heap limit callback, which
         // we'll take back in the `Isolate`'s destructor.
@@ -303,12 +305,12 @@ impl<RT: Runtime> Isolate<RT> {
         Ok(())
     }
 
-    pub async fn start_request<E: IsolateEnvironment<RT>>(
+    pub async fn start_request<E: V8IsolateEnvironment<RT>>(
         &mut self,
         context_cache: &mut ContextCache,
         permit: ConcurrencyPermit,
         environment: E,
-    ) -> anyhow::Result<(IsolateHandle, RequestState<RT, E>, Timeout<RT>)> {
+    ) -> anyhow::Result<(ExecutionHandle, RequestState<RT, E>, Timeout<RT>)> {
         // Double check that the isolate is clean.
         // It's unexpected to encounter this error, since we are supposed to
         // have already checked after the last request finished, but in practice
@@ -316,19 +318,12 @@ impl<RT: Runtime> Isolate<RT> {
         self.check_isolate_clean(context_cache).with_context(|| {
             rejected_before_execution_error(RejectedBeforeExecutionReason::IsolateNotClean)
         })?;
-        let context_id = self.handle.push_context(false /* nested */);
-        let mut user_timeout = environment.user_timeout();
-        if let Some(max_user_timeout) = self.max_user_timeout {
-            // We apply the minimum between the timeout from the environment
-            // and the max_user_timeout, that is set from tets.
-            user_timeout = user_timeout.min(max_user_timeout);
-        }
-        let timeout = Timeout::new(
+        let (context_id, timeout) = start_request_on_handle(
             self.rt.clone(),
-            self.handle.clone(),
-            Some(user_timeout),
-            Some(environment.system_timeout()),
+            &self.handle,
             permit,
+            &environment,
+            self.max_user_timeout,
         );
         let state = RequestState::new(self.rt.clone(), environment, context_id);
         Ok((self.handle.clone(), state, timeout))
@@ -340,6 +335,10 @@ impl<RT: Runtime> Isolate<RT> {
 
     pub fn created(&self) -> &tokio::time::Instant {
         &self.created
+    }
+
+    pub fn set_heap_stats_handle(&mut self, heap_stats: SharedIsolateHeapStats) {
+        self.handle.set_heap_stats_handle(heap_stats);
     }
 }
 
@@ -370,7 +369,7 @@ impl<RT: Runtime> Drop for Isolate<RT> {
 }
 
 struct HeapContext {
-    handle: IsolateHandle,
+    handle: ExecutionHandle,
 }
 
 extern "C" fn near_heap_limit_callback(

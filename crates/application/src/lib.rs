@@ -57,6 +57,7 @@ use common::{
         index::{
             database_index::IndexedFields,
             index_validation_error,
+            IndexConfig,
             IndexMetadata,
         },
         schema::{
@@ -133,6 +134,7 @@ use common::{
         env_var_total_size,
         env_var_total_size_limit_met,
         AllowedVisibility,
+        AttributionClaims,
         ConvexOrigin,
         ConvexSite,
         DeploymentMetadata,
@@ -235,6 +237,10 @@ use model::{
         ComponentsModel,
     },
     config::{
+        module_loader::{
+            ModuleLoader,
+            UncachedModuleLoader,
+        },
         types::{
             ConfigFile,
             ConfigMetadata,
@@ -369,7 +375,6 @@ use udf::{
         CONVEX_ORIGIN,
         CONVEX_SITE,
     },
-    ActionCallbacks,
     HttpActionRequest,
     HttpActionResponseStreamer,
     HttpActionResult,
@@ -409,7 +414,6 @@ use crate::{
         FunctionMetricsLog,
     },
     log_visibility::LogVisibility,
-    module_cache::ModuleCache,
     redaction::{
         RedactedJsError,
         RedactedLogLines,
@@ -420,6 +424,7 @@ use crate::{
     },
 };
 
+pub mod ai_gateway_jwt;
 pub mod airbyte_import;
 pub mod api;
 pub mod app_metric_seed;
@@ -432,22 +437,24 @@ pub mod deployment_state;
 mod execute_query_timestamp;
 mod exports;
 pub mod function_log;
-pub mod llm_gateway_jwt;
 pub mod log_streaming;
 pub mod log_visibility;
 mod metrics;
-mod module_cache;
 pub mod redaction;
 pub mod scheduled_jobs;
 mod schema_worker;
 pub mod snapshot_import;
+mod source_map_cache;
 mod streaming_export;
 mod system_table_cleanup;
 mod table_summary_worker;
 pub mod valid_identifier;
 mod worker_handles;
 
-pub use crate::cache::QueryCache;
+pub use crate::{
+    cache::QueryCache,
+    source_map_cache::SourceMapCache,
+};
 use crate::{
     metrics::{
         log_external_deps_package,
@@ -611,7 +618,6 @@ pub struct Application<RT: Runtime> {
     deployment: DeploymentMetadata,
     workers: WorkerHandles,
     log_visibility: Arc<dyn LogVisibility<RT>>,
-    module_cache: ModuleCache<RT>,
     system_env_var_names: HashSet<EnvVarName>,
     app_auth: Arc<ApplicationAuth<RT>>,
     log_manager_client: LogManagerClient,
@@ -716,7 +722,8 @@ impl<RT: Runtime> Application<RT> {
         export_provider: Arc<dyn ExportProvider<RT>>,
         deleted_tablet_receiver: tokio::sync::mpsc::Receiver<TabletId>,
         oidc_http_client: CachedHttpClient,
-        llm_gateway_jwt_minter: Option<Arc<dyn llm_gateway_jwt::LlmGatewayJwtMinter>>,
+        ai_gateway_jwt_minter: Option<Arc<dyn ai_gateway_jwt::AiGatewayJwtMinter>>,
+        source_map_cache: SourceMapCache<RT>,
     ) -> anyhow::Result<Self> {
         // Wrap the usage logger so usage is recorded for enforcement before
         // being forwarded downstream.
@@ -726,10 +733,6 @@ impl<RT: Runtime> Application<RT> {
 
         let deployment_name = deployment.name.clone();
         let deployment_region = deployment.region.clone();
-        let module_cache =
-            ModuleCache::new(runtime.clone(), application_storage.modules_storage.clone()).await;
-        let module_loader = Arc::new(module_cache.clone());
-
         let default_system_env_vars = btreemap! {
             CONVEX_ORIGIN.clone() => convex_origin.parse()?,
             CONVEX_SITE.clone() => convex_site.parse()?
@@ -861,12 +864,13 @@ impl<RT: Runtime> Application<RT> {
             node_actions,
             file_storage.transactional_file_storage.clone(),
             application_storage.modules_storage.clone(),
-            module_loader,
+            source_map_cache,
             function_log.clone(),
             audit_log_client.clone(),
             default_system_env_vars.clone(),
             cache,
-            llm_gateway_jwt_minter,
+            ai_gateway_jwt_minter,
+            deployment.clone(),
         ));
         function_runner.set_action_callbacks(runner.clone());
 
@@ -920,7 +924,7 @@ impl<RT: Runtime> Application<RT> {
             application_storage.modules_storage.clone(),
         );
         let migration_worker = Arc::new(Mutex::new(Some(
-            runtime.spawn("migration_worker", migration_worker.go()),
+            runtime.spawn("migration_worker", Box::pin(migration_worker.go())),
         )));
 
         let usage_gauges_tracking_worker = UsageGaugesTrackingWorker::start(
@@ -929,7 +933,7 @@ impl<RT: Runtime> Application<RT> {
             usage_event_logger.clone(),
             Arc::new(log_manager_client.clone()),
             deployment_name.clone(),
-        );
+        )?;
 
         let workers = WorkerHandles {
             usage_gauges_tracking_worker,
@@ -963,7 +967,6 @@ impl<RT: Runtime> Application<RT> {
             deployment,
             workers,
             log_visibility,
-            module_cache,
             system_env_var_names: default_system_env_vars.into_keys().collect(),
             app_auth,
             log_manager_client,
@@ -984,10 +987,6 @@ impl<RT: Runtime> Application<RT> {
         &self.application_storage.modules_storage
     }
 
-    pub fn modules_cache(&self) -> &ModuleCache<RT> {
-        &self.module_cache
-    }
-
     pub fn key_broker(&self) -> &KeyBroker {
         &self.key_broker
     }
@@ -996,8 +995,12 @@ impl<RT: Runtime> Application<RT> {
         self.runner.clone()
     }
 
-    pub async fn issue_llm_gateway_jwt(&self) -> anyhow::Result<String> {
-        self.runner.issue_llm_gateway_jwt().await
+    pub async fn mint_ai_gateway_jwt(
+        &self,
+        identity: &Identity,
+        claims: AttributionClaims,
+    ) -> anyhow::Result<String> {
+        self.runner.mint_ai_gateway_jwt(identity, claims).await
     }
 
     pub fn metrics_log(&self, identity: &Identity) -> anyhow::Result<FunctionMetricsLog<'_, RT>> {
@@ -2130,11 +2133,12 @@ impl<RT: Runtime> Application<RT> {
         let auth_config_metadata = ModuleModel::new(tx).get_metadata(path.clone()).await?;
         if let Some(auth_config_metadata) = auth_config_metadata {
             let environment = auth_config_metadata.environment;
-            let auth_config_source = runner
-                .module_cache
-                .get_module(tx, path)
-                .await?
-                .context("Module has metadata but no source")?;
+            let auth_config_source = UncachedModuleLoader {
+                modules_storage: runner.modules_storage.clone(),
+            }
+            .get_module(tx, path)
+            .await?
+            .context("Module has metadata but no source")?;
             let auth_config_module = ModuleConfig {
                 path: AUTH_CONFIG_FILE_NAME.parse()?,
                 source: auth_config_source.source.clone(),
@@ -2954,29 +2958,27 @@ impl<RT: Runtime> Application<RT> {
         let namespace = TableNamespace::by_component_TODO();
         for (index_name, index_fields) in indexes.into_iter() {
             let index_fields = self._validate_user_defined_index_fields(index_fields)?;
-            let index_metadata =
-                IndexMetadata::new_backfilling(*tx.begin_timestamp(), index_name, index_fields);
-            let mut model = IndexModel::new(&mut tx);
-            if let Some(existing_index_metadata) = model
-                .pending_index_metadata(namespace, &index_metadata.name)?
-                .or(model.enabled_index_metadata(namespace, &index_metadata.name)?)
-            {
-                if !index_metadata
-                    .config
-                    .same_spec(&existing_index_metadata.config)
+            let existing_index_metadata = {
+                let mut model = IndexModel::new(&mut tx);
+                model
+                    .pending_index_metadata(namespace, &index_name)?
+                    .or(model.enabled_index_metadata(namespace, &index_name)?)
+            };
+            if let Some(existing_index_metadata) = existing_index_metadata {
+                if let IndexConfig::Database { spec, .. } = &existing_index_metadata.config
+                    && spec.fields == index_fields
                 {
-                    IndexModel::new(&mut tx)
-                        .drop_index(existing_index_metadata.id())
-                        .await?;
-                    IndexModel::new(&mut tx)
-                        .add_system_index(namespace, index_metadata)
-                        .await?;
+                    continue;
                 }
-            } else {
                 IndexModel::new(&mut tx)
-                    .add_system_index(namespace, index_metadata)
+                    .drop_index(existing_index_metadata.id())
                     .await?;
             }
+            let index_metadata =
+                IndexMetadata::new_backfilling(*tx.begin_timestamp(), index_name, index_fields);
+            IndexModel::new(&mut tx)
+                .add_system_index(namespace, index_metadata)
+                .await?;
         }
         self.commit(tx, "add_system_indexes").await?;
         Ok(())

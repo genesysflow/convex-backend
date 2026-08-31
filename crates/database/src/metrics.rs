@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ::search::metrics::{
     SearchType,
     SEARCH_TYPE_LABEL,
@@ -32,6 +34,7 @@ use prometheus::{
 
 use crate::{
     transaction::FinalTransaction,
+    IndexRetentionSource,
     RetentionType,
     Transaction,
 };
@@ -53,11 +56,52 @@ pub fn user_documents_size_subgauge() -> Subgauge {
 }
 
 register_convex_int_gauge!(
-    COMMITTER_CONCURRENT_PERSISTENCE_WRITES,
-    "Number of commits between starting their persistence write and publishing"
+    COMMITTER_CONCURRENT_COMMITS,
+    "Number of commits the committer has admitted but not yet published: awaiting pre-validation, \
+     pre-validating, or writing to persistence. This is the quantity compared against \
+     COMMITTER_MAX_CONCURRENT_COMMITS to pause admission. An in-flight max_repeatable_ts bump \
+     also counts as one"
 );
-pub fn concurrent_persistence_writes_subgauge() -> Subgauge {
-    Subgauge::new(COMMITTER_CONCURRENT_PERSISTENCE_WRITES.clone())
+pub fn concurrent_commits_subgauge() -> Subgauge {
+    Subgauge::new(COMMITTER_CONCURRENT_COMMITS.clone())
+}
+
+register_convex_int_gauge!(
+    COMMITTER_AWAITING_PRE_VALIDATION_COMMITS,
+    "Number of admitted commits waiting for a free pre-validation lane"
+);
+pub fn awaiting_pre_validation_commits_subgauge() -> Subgauge {
+    Subgauge::new(COMMITTER_AWAITING_PRE_VALIDATION_COMMITS.clone())
+}
+
+register_convex_int_gauge!(
+    COMMITTER_PRE_VALIDATING_COMMITS,
+    "Number of commits in in-flight pre-validation batches"
+);
+pub fn pre_validating_commits_subgauge() -> Subgauge {
+    Subgauge::new(COMMITTER_PRE_VALIDATING_COMMITS.clone())
+}
+
+register_convex_histogram!(
+    DATABASE_COMMIT_ADMISSION_PAUSE_SECONDS,
+    "How long the committer went without accepting new messages because commits in flight were at \
+     COMMITTER_MAX_CONCURRENT_COMMITS. One observation per contiguous pause"
+);
+pub fn log_commit_admission_pause(pause: Duration) {
+    log_distribution(
+        &DATABASE_COMMIT_ADMISSION_PAUSE_SECONDS,
+        pause.as_secs_f64(),
+    );
+}
+
+register_convex_histogram!(
+    DATABASE_COMMIT_VALIDATION_WINDOW_SECONDS,
+    "Width of the (validated_through, commit_ts] range the committer conflict-checks on its own \
+     thread. Pre-validation exists to keep this narrow, so the full (begin_ts, commit_ts] width \
+     shows up here whenever pre-validation could not narrow the range"
+);
+pub fn log_commit_validation_window(window_seconds: f64) {
+    log_distribution(&DATABASE_COMMIT_VALIDATION_WINDOW_SECONDS, window_seconds);
 }
 
 register_convex_histogram!(DOCUMENTS_KEYS_TOTAL, "Total number of document keys");
@@ -276,7 +320,11 @@ pub fn commit_client_timer(identity: &Identity) -> Timer<VMHistogramVec> {
     timer
 }
 
-register_convex_histogram!(DATABASE_COMMIT_QUEUE_SECONDS, "Time a commit is queued");
+register_convex_histogram!(
+    DATABASE_COMMIT_QUEUE_SECONDS,
+    "Time from enqueueing a commit to it reaching the committer thread: the committer queue wait, \
+     plus the wait for a pre-validation lane and the off-thread conflict check itself"
+);
 pub fn commit_queue_timer() -> Timer<VMHistogram> {
     Timer::new(&DATABASE_COMMIT_QUEUE_SECONDS)
 }
@@ -309,6 +357,23 @@ pub fn commit_is_stale_timer() -> StatusTimer {
 }
 
 register_convex_histogram!(
+    DATABASE_COMMIT_PRE_VALIDATE_SECONDS,
+    "Time spent conflict-checking a batch of staged commits against the write log, off the \
+     committer thread"
+);
+pub fn commit_pre_validate_timer() -> Timer<VMHistogram> {
+    Timer::new(&DATABASE_COMMIT_PRE_VALIDATE_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_COMMIT_PRE_VALIDATE_BATCH_TOTAL,
+    "Number of commits pre-validated together in one batch"
+);
+pub fn log_commit_pre_validate_batch_size(size: usize) {
+    log_distribution(&DATABASE_COMMIT_PRE_VALIDATE_BATCH_TOTAL, size as f64);
+}
+
+register_convex_histogram!(
     DATABASE_COMMIT_PREPARE_WRITES_SECONDS,
     "Time to prepare writes",
     &STATUS_LABEL
@@ -319,11 +384,30 @@ pub fn commit_prepare_writes_timer() -> StatusTimer {
 
 register_convex_histogram!(
     DATABASE_COMMIT_PERSISTENCE_WRITE_SECONDS,
-    "Time to commit a persistence write",
+    "Time to write one batch of commits to persistence. Sampled once per batch, so a batch \
+     carrying several commits contributes a single observation",
     &STATUS_LABEL
 );
 pub fn commit_persistence_write_timer() -> StatusTimer {
     StatusTimer::new(&DATABASE_COMMIT_PERSISTENCE_WRITE_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_WRITE_BATCH_COMMITS,
+    "Number of commits combined into one batched persistence write"
+);
+register_convex_histogram!(
+    DATABASE_WRITE_BATCH_DOCUMENTS,
+    "Number of document rows in one batched persistence write"
+);
+register_convex_histogram!(
+    DATABASE_WRITE_BATCH_BYTES,
+    "Serialized size of one batched persistence write"
+);
+pub fn log_write_batch(num_commits: usize, num_documents: usize, size_bytes: u64) {
+    log_distribution(&DATABASE_WRITE_BATCH_COMMITS, num_commits as f64);
+    log_distribution(&DATABASE_WRITE_BATCH_DOCUMENTS, num_documents as f64);
+    log_distribution(&DATABASE_WRITE_BATCH_BYTES, size_bytes as f64);
 }
 
 register_convex_histogram!(
@@ -370,6 +454,14 @@ pub fn write_log_commit_bytes(bytes: usize) {
 register_convex_counter!(DATABASE_COMMIT_ROWS, "Number of commits to database");
 pub fn commit_rows(num_rows: u64) {
     log_counter(&DATABASE_COMMIT_ROWS, num_rows);
+}
+
+register_convex_counter!(
+    DATABASE_COMMIT_INDEX_ROWS,
+    "Number of index rows written to persistence"
+);
+pub fn commit_index_rows(num_rows: u64) {
+    log_counter(&DATABASE_COMMIT_INDEX_ROWS, num_rows);
 }
 
 register_convex_histogram!(
@@ -467,10 +559,16 @@ pub fn retention_delete_documents_timer() -> Timer<VMHistogram> {
 
 register_convex_histogram!(
     INDEX_RETENTION_DELETE_CHUNK_SECONDS,
-    "Time for index retention to delete one chunk"
+    "Time for index retention to delete one chunk",
+    &["source"]
 );
-pub fn index_retention_delete_chunk_timer() -> Timer<VMHistogram> {
-    Timer::new(&INDEX_RETENTION_DELETE_CHUNK_SECONDS)
+pub fn index_retention_delete_chunk_timer(source: IndexRetentionSource) -> Timer<VMHistogramVec> {
+    let mut timer = Timer::new_with_labels(&INDEX_RETENTION_DELETE_CHUNK_SECONDS);
+    timer.add_label(StaticMetricLabel::new(
+        "source",
+        <&'static str>::from(source),
+    ));
+    timer
 }
 
 register_convex_histogram!(
@@ -615,10 +713,18 @@ pub fn log_retention_expired_index_entry(is_tombstone: bool, is_key_change_tombs
 register_convex_counter!(
     RETENTION_INDEX_ENTRIES_DELETED_TOTAL,
     "The total number of index entries persistence returns as having been actually deleted by \
-     retention."
+     retention.",
+    &["source"]
 );
-pub fn log_retention_index_entries_deleted(deleted_rows: usize) {
-    log_counter(&RETENTION_INDEX_ENTRIES_DELETED_TOTAL, deleted_rows as u64)
+pub fn log_retention_index_entries_deleted(deleted_rows: usize, source: IndexRetentionSource) {
+    log_counter_with_labels(
+        &RETENTION_INDEX_ENTRIES_DELETED_TOTAL,
+        deleted_rows as u64,
+        vec![StaticMetricLabel::new(
+            "source",
+            <&'static str>::from(source),
+        )],
+    )
 }
 
 register_convex_counter!(
@@ -994,13 +1100,4 @@ register_convex_histogram!(
 );
 pub fn log_write_throughput(bytes: u64) {
     log_distribution(&WRITE_THROUGHPUT_BYTES, bytes as f64);
-}
-
-register_convex_histogram!(
-    WRITE_LOG_ITER_WRITES_AFTER_SECONDS,
-    "Time to execute WriteLogReader::iter_writes_after in seconds",
-    &STATUS_LABEL,
-);
-pub fn write_log_iter_writes_timer() -> StatusTimer {
-    StatusTimer::new(&WRITE_LOG_ITER_WRITES_AFTER_SECONDS)
 }

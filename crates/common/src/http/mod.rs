@@ -486,6 +486,17 @@ impl RouteMapper for NoopRouteMapper {
     }
 }
 
+fn concurrency_metric_name(service_name: &str, namespace: &str) -> String {
+    let name = format!(
+        "{}_http_service_concurrent_requests",
+        service_name.replace('-', "_")
+    );
+    // The registry already prefixes metrics with the executable name.
+    name.strip_prefix(&format!("{namespace}_"))
+        .unwrap_or(&name)
+        .to_owned()
+}
+
 /// Router + Middleware for a Convex service
 pub struct ConvexHttpService {
     router: Router,
@@ -511,10 +522,7 @@ impl ConvexHttpService {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
         let semaphore_ = semaphore.clone();
         let concurrency_gauge = PullingGauge::new(
-            format!(
-                "{}_http_service_concurrent_requests",
-                service_name.replace('-', "_")
-            ),
+            concurrency_metric_name(service_name, &SERVICE_NAME),
             "The number of currently outstanding requests on the ConvexHttpService",
             Box::new(move || (max_concurrency - semaphore_.available_permits()) as f64),
         )
@@ -846,6 +854,17 @@ impl std::fmt::Display for RequestDestination {
 pub struct ResolvedHostname {
     pub deployment_name: String,
     pub destination: RequestDestination,
+    pub source: ResolvedHostnameSource,
+}
+
+/// How the deployment was resolved, so default-domain restrictions can
+/// distinguish built-in aliases from registered custom domains and local
+/// routing.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedHostnameSource {
+    DefaultDomain,
+    CustomDomain,
+    Local,
 }
 
 pub const CONVEX_DOMAIN_REGEX_INSTANCE_CAPTURE: &str = "instance";
@@ -869,6 +888,7 @@ pub fn resolve_convex_domain(uri: &Uri) -> anyhow::Result<Option<ResolvedHostnam
         return Ok(Some(ResolvedHostname {
             deployment_name,
             destination,
+            source: ResolvedHostnameSource::DefaultDomain,
         }));
     }
     Ok(None)
@@ -909,6 +929,7 @@ impl<S: Sync> FromRequestParts<S> for ExtractResolvedHostname {
         Ok(ExtractResolvedHostname(ResolvedHostname {
             deployment_name: ::std::env::var("CONVEX_SITE").unwrap_or_default(),
             destination: RequestDestination::ConvexCloud,
+            source: ResolvedHostnameSource::Local,
         }))
     }
 }

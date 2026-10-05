@@ -18,6 +18,7 @@ use common::{
     },
     document::DeveloperDocument,
     knobs::{
+        COMPONENT_GET_USER_IDENTITY_LOG_SAMPLE_RATIO,
         MAX_REACTOR_CALL_DEPTH,
         MAX_SYSCALL_BATCH_SIZE,
         TRANSACTION_MAX_READ_SIZE_ROWS,
@@ -32,11 +33,14 @@ use common::{
         Runtime,
         UnixTimestamp,
     },
+    sha256::Sha256,
     try_anyhow,
     types::{
         AllowedVisibility,
         DeploymentClass,
+        ObjectKey,
         RegionName,
+        StorageUuid,
         UdfType,
         WriteTimestamp,
     },
@@ -54,6 +58,7 @@ use database::{
     BootstrapComponentsModel,
     DeveloperQuery,
     PatchValue,
+    PendingFileUpload,
     Transaction,
     TransactionLimits,
     UserFacingModel,
@@ -64,6 +69,7 @@ use errors::{
     ErrorMetadata,
     ErrorMetadataAnyhowExt,
 };
+use headers::ContentType;
 use itertools::Itertools;
 use model::{
     components::{
@@ -85,6 +91,7 @@ use model::{
     },
     virtual_system_mapping,
 };
+use rand::Rng;
 use serde::{
     Deserialize,
     Serialize,
@@ -111,6 +118,7 @@ use value::{
     id_v6::DeveloperDocumentId,
     obj,
     serialized_args_ext::SerializedArgsExt,
+    sha256::Sha256Digest,
     ConvexArray,
     ConvexObject,
     PendingValue,
@@ -410,11 +418,76 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
             .await
     }
 
+    /// Writes the `_file_storage` entry for a file stored by this function and
+    /// stages its contents for upload once the function finishes.
+    async fn file_storage_store(
+        &mut self,
+        blob: Vec<u8>,
+        content_type: Option<ContentType>,
+        expected_sha256: Option<Sha256Digest>,
+    ) -> anyhow::Result<DeveloperDocumentId> {
+        let sha256 = Sha256::hash(&blob);
+        if let Some(expected_sha256) = expected_sha256
+            && expected_sha256 != sha256
+        {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "Sha256Mismatch",
+                format!(
+                    "Sha256 mismatch. Expected: {} Actual: {}",
+                    expected_sha256.as_base64(),
+                    sha256.as_base64()
+                )
+            ));
+        }
+        let storage_key: ObjectKey = self.rt.new_uuid_v4().to_string().try_into()?;
+        let storage_id = StorageUuid::from(self.rt.new_uuid_v4());
+
+        let namespace: TableNamespace = self.phase.component()?.into();
+        let tx = self.phase.tx()?;
+        let max_files = tx.transaction_limits().files_written;
+        let max_bytes = tx.transaction_limits().file_write_bytes;
+        let written = tx.execution_size().file_storage_write_size;
+        anyhow::ensure!(
+            written.num_writes < max_files,
+            ErrorMetadata::bad_request(
+                "TooManyFilesWritten",
+                format!("Too many files stored by this mutation (limit: {max_files})")
+            )
+        );
+        anyhow::ensure!(
+            written.size + blob.len() <= max_bytes,
+            ErrorMetadata::bad_request(
+                "FilesWrittenTooLarge",
+                format!(
+                    "Too large total size of the files stored by this mutation (limit: \
+                     {max_bytes} bytes)"
+                )
+            )
+        );
+        let entry = FileStorageEntry {
+            storage_id,
+            storage_key,
+            sha256,
+            size: blob.len().try_into()?,
+            content_type: content_type.map(|ct| ct.to_string()),
+        };
+        let (id, virtual_id) = self
+            .file_storage
+            .store_file_entry(tx, namespace, entry)
+            .await?;
+        tx.add_pending_file_upload(id, PendingFileUpload { bytes: blob.into() })?;
+        Ok(virtual_id)
+    }
+
     async fn file_storage_delete(&mut self, storage_id: FileStorageId) -> anyhow::Result<()> {
         let component = self.phase.component()?;
-        self.file_storage
-            .delete(self.phase.tx()?, component.into(), storage_id)
-            .await
+        let tx = self.phase.tx()?;
+        let id = self
+            .file_storage
+            .delete(tx, component.into(), storage_id)
+            .await?;
+        tx.remove_pending_file_upload(&id)?;
+        Ok(())
     }
 
     async fn file_storage_get_entry(
@@ -692,6 +765,7 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
                 "1.0/storageGenerateUploadUrl" => {
                     Box::pin(storage_generate_upload_url(provider, args)).await
                 },
+                "1.0/storageStore" => Box::pin(storage_store(provider, args)).await,
                 // Scheduling
                 "1.0/schedule" => Box::pin(schedule(provider, args)).await,
                 "1.0/cancel_job" => Box::pin(cancel_job(provider, args)).await,
@@ -757,6 +831,10 @@ fn tx_metrics<RT: Runtime>(
         documentsWritten: LimitedValue,
         functionsScheduled: LimitedValue,
         scheduledFunctionArgsBytes: LimitedValue,
+        filesWritten: LimitedValue,
+        fileWriteBytes: LimitedValue,
+        filesRead: LimitedValue,
+        fileReadBytes: LimitedValue,
     }
     Ok(serde_json::value::to_raw_value(&TxMetricsJson {
         bytesRead: limit_value(limits.bytes_read, s.read_size.total_document_size),
@@ -769,6 +847,10 @@ fn tx_metrics<RT: Runtime>(
             limits.scheduled_function_args_bytes,
             s.scheduled_size.size,
         ),
+        filesWritten: limit_value(limits.files_written, s.file_storage_write_size.num_writes),
+        fileWriteBytes: limit_value(limits.file_write_bytes, s.file_storage_write_size.size),
+        filesRead: limit_value(limits.files_read, s.file_storage_read_size.num_reads),
+        fileReadBytes: limit_value(limits.file_read_bytes, s.file_storage_read_size.size),
     })?)
 }
 
@@ -894,10 +976,23 @@ async fn get_user_identity<RT: Runtime>(
 ) -> anyhow::Result<Box<RawValue>> {
     provider.phase.observe_identity()?;
     // TODO: Somehow make the Transaction aware of the dependency on the user.
+    let component = provider.phase.component()?;
     let tx = provider.phase.tx()?;
     let user_identity = tx.user_identity();
-    if !provider.phase.component()?.is_root() {
+    if !component.is_root() {
         log_component_get_user_identity(user_identity.is_some());
+        if provider
+            .rt
+            .rng()
+            .random_bool(*COMPONENT_GET_USER_IDENTITY_LOG_SAMPLE_RATIO)
+        {
+            let component_path = tx.get_component_path_untracked(component);
+            tracing::info!(
+                component_path = ?component_path,
+                has_user_identity = user_identity.is_some(),
+                "component called getUserIdentity()"
+            );
+        }
     }
     if let Some(user_identity) = user_identity {
         return Ok(serde_json::value::to_raw_value(&JsonValue::try_from(
@@ -976,6 +1071,46 @@ async fn storage_delete<RT: Runtime>(
     provider.file_storage_delete(storage_id).await?;
 
     Ok(RawValue::NULL.to_owned())
+}
+
+#[convex_macro::instrument_future]
+async fn storage_store<RT: Runtime>(
+    provider: &mut DatabaseUdfSyscallProvider<RT>,
+    args: JsonValue,
+) -> anyhow::Result<Box<RawValue>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StorageStoreArgs {
+        /// Base64-encoded file contents.
+        blob: String,
+        content_type: Option<String>,
+        /// Base64-encoded sha256 of the contents, to check them against.
+        sha256: Option<String>,
+    }
+    let (blob, content_type, expected_sha256) = with_argument_error("storage.store", || {
+        let StorageStoreArgs {
+            blob,
+            content_type,
+            sha256,
+        } = serde_json::from_value(args)?;
+        let blob = base64::decode(&blob).context(ArgName("blob"))?;
+        let content_type = content_type
+            .filter(|ct| !ct.is_empty())
+            .map(|ct| mime::Mime::from_str(&ct).map(ContentType::from))
+            .transpose()
+            .context(ArgName("contentType"))?;
+        let expected_sha256 = sha256
+            .as_deref()
+            .map(Sha256Digest::from_base64)
+            .transpose()
+            .context(ArgName("sha256"))?;
+        Ok((blob, content_type, expected_sha256))
+    })?;
+
+    let storage_id = provider
+        .file_storage_store(blob, content_type, expected_sha256)
+        .await?;
+    Ok(serde_json::value::to_raw_value(&storage_id.encode())?)
 }
 
 #[convex_macro::instrument_future]

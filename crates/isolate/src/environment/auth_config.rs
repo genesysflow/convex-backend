@@ -55,6 +55,7 @@ use crate::{
         },
         AsyncOpRequest,
         JsEnvironment,
+        OpProvider,
         SyscallProvider,
     },
     helpers,
@@ -75,7 +76,7 @@ pub struct AuthConfigEnvironment {
     environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
 }
 
-impl<RT: Runtime> SyscallProvider<RT> for AuthConfigEnvironment {
+impl OpProvider for AuthConfigEnvironment {
     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         tracing::warn!(
             "Unexpected Console access when evaluating auth config file: {}",
@@ -145,7 +146,9 @@ impl<RT: Runtime> SyscallProvider<RT> for AuthConfigEnvironment {
             "Getting the table mapping unsupported when evaluating auth config file"
         ))
     }
+}
 
+impl<RT: Runtime> SyscallProvider<RT> for AuthConfigEnvironment {
     async fn lookup_source(
         &mut self,
         path: &str,
@@ -354,8 +357,8 @@ fn check_for_common_confusions(config_str: &str) -> anyhow::Result<()> {
                         format!(
                             "This auth configuration appears potentially insecure: Provider at \
                              index {index} has an issuer that is shared among many applications, \
-                             so must to specify an ApplicationID to check against an `aud` field \
-                             of a JWT.",
+                             so must specify an ApplicationID to check against an `aud` field of \
+                             a JWT.",
                         ),
                     ));
                 }

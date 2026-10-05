@@ -36,6 +36,7 @@ use common::{
     execution_context::{
         ExecutionContext,
         RequestContext,
+        RequestId,
     },
     fastrace_helpers::EncodedSpan,
     knobs::{
@@ -76,7 +77,6 @@ use common::{
         NodeDependency,
         QueryInvocation,
         Timestamp,
-        UdfIdentifier,
         UdfType,
     },
 };
@@ -106,6 +106,7 @@ use futures::{
     FutureExt,
 };
 use keybroker::{
+    DeploymentOp,
     Identity,
     KeyBroker,
 };
@@ -158,6 +159,7 @@ use node_executor::{
     ExecuteRequest,
     NodeActions,
 };
+use roles::RequireDeploymentOp;
 use serde_json::Value as JsonValue;
 use storage::Storage;
 use sync_types::{
@@ -536,12 +538,17 @@ impl<RT: Runtime> Limiter<RT> {
             } => match x {},
             _ = rt.wait(self.semaphore_timeout) => {
                 log_function_wait_timeout(self.env, self.udf_type);
+                let functions = match self.udf_type {
+                    UdfType::Query => "queries",
+                    UdfType::Mutation => "mutations",
+                    UdfType::Action => "actions",
+                    UdfType::HttpAction => "HTTP actions",
+                };
                 anyhow::bail!(ErrorMetadata::rate_limited(
                     "TooManyConcurrentRequests",
                     format!(
-                        "Too many concurrent requests. Your backend is limited to {} concurrent {}s. {}",
+                        "Too many concurrent requests. Your backend is limited to {} concurrent {functions}. {}",
                         self.total_permits,
-                        self.udf_type.to_lowercase_string(),
                         if self.total_permits > DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY {
                             "If you need more resources, please contact support."
                         } else {
@@ -742,10 +749,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
     /// claims from Conductor's gRPC handler.
     pub async fn mint_ai_gateway_jwt(
         &self,
-        _identity: &Identity,
+        identity: &Identity,
         attribution: AttributionClaims,
+        request_id: &RequestId,
     ) -> anyhow::Result<String> {
+        match identity {
+            // Deploy keys and dashboard members carry an op set, from the key's
+            // `allowed_operations` or the member's custom roles, so hold them to
+            // it.
+            Identity::DeploymentAdmin(_) | Identity::ActingUser(..) => {
+                identity.require_operation(DeploymentOp::UseAiGateway)?
+            },
+            // End users authenticate against the app's own auth config and have
+            // no op set. Gating them would reject the ordinary case of an app
+            // user triggering an action that calls the gateway.
+            Identity::System(_) | Identity::User(_) | Identity::Unknown(_) => {},
+        }
         let mut tx = self.database.begin_system().await?;
+        self.bail_if_backend_not_running(&mut tx).await?;
         let ai_gateway_disabled = BackendInfoModel::new(&mut tx)
             .get()
             .await?
@@ -768,7 +789,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  provider directly with your own API key."
             ));
         };
-        minter.mint(&self.deployment, attribution)
+        minter.mint(&self.deployment, attribution, request_id).await
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
@@ -911,14 +932,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("mutation"));
         }
-        let write_source = {
-            let component_path = path.clone().debug_into_component_path();
-            if path.is_system() {
-                WriteSource::SystemUdf(Arc::new(UdfIdentifier::Function(component_path)))
-            } else {
-                WriteSource::Udf(Arc::new(UdfIdentifier::Function(component_path)))
-            }
-        };
+        let write_source = WriteSource::mutation(path.clone().debug_into_component_path());
 
         let mut backoff = Backoff::new(
             *UDF_EXECUTOR_OCC_INITIAL_BACKOFF,
@@ -2108,8 +2122,9 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         &self,
         identity: Identity,
         caller: AttributedCaller,
+        request_id: RequestId,
     ) -> anyhow::Result<String> {
-        self.mint_ai_gateway_jwt(&identity, AttributionClaims::from(caller))
+        self.mint_ai_gateway_jwt(&identity, AttributionClaims::from(caller), &request_id)
             .await
     }
 
@@ -2249,7 +2264,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                         let component_path = tx
                             .get_component_path(component)
                             .context(format!("Component {component:?} not found"))?;
-                        let id = self
+                        let (_, id) = self
                             .file_storage
                             .store_file_entry(tx, component.into(), entry.clone())
                             .await?;

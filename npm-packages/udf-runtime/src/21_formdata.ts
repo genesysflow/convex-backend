@@ -109,11 +109,14 @@ export class FormData {
   [Symbol.iterator](): IterableIterator<[string, FormDataEntryValue]> {
     return this.entries();
   }
-
-  get [Symbol.toStringTag]() {
-    return "FormData";
-  }
 }
+
+Object.defineProperty(FormData.prototype, Symbol.toStringTag, {
+  value: "FormData",
+  enumerable: false,
+  writable: false,
+  configurable: true,
+});
 
 export type MimeType = {
   essence: string;
@@ -149,7 +152,9 @@ export const parseFormData = async (
         formData.append(
           formEntry.name,
           new Blob([formEntry.file.data], {
-            type: formEntry.file.contentType,
+            // A part without a Content-Type header arrives as `null`, which
+            // the Blob constructor would stringify to "null".
+            type: formEntry.file.contentType ?? undefined,
           }),
           formEntry.file.fileName,
         );

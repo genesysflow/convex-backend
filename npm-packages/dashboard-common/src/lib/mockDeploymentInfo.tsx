@@ -14,6 +14,8 @@ export const mockDeploymentInfo: DeploymentInfo = {
     slug: "team",
   }),
   useTeamMembers: () => [],
+  useCurrentMemberName: () => undefined,
+  useMemberPreference: () => ({ value: undefined, set: async () => {} }),
   useTeamEntitlements: () => ({}),
   useCurrentUsageBanner: () => null,
   useCurrentProject: () => ({
@@ -108,5 +110,9 @@ export const mockDeploymentInfo: DeploymentInfo = {
   deploymentsURI: "",
   isSelfHosted: true,
   workosIntegrationEnabled: false,
+  s3ExportIntegrationEnabled: false,
   connectionStateCheckIntervalMs: 2500,
+  showFivetranSyncProgress: false,
+  openFeedbackForm: () => {},
+  captureEvent: () => {},
 };

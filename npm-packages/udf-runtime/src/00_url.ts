@@ -13,6 +13,9 @@ type Update =
       href: string;
     }
   | {
+      password: string;
+    }
+  | {
       port: string | null;
     }
   | {
@@ -26,20 +29,72 @@ type Update =
     }
   | {
       searchParams: [string, string][];
+    }
+  | {
+      username: string;
     };
 
 // Private symbols for URL to poke at the internals of URLSearchParams
 const _searchParamPairs = Symbol("_searchParamPairs");
 const _urlObjectUpdate = Symbol("_urlObjectUpdate");
 
+class URLSearchParamsIterator<T> implements IterableIterator<T> {
+  #params: URLSearchParams;
+  #index = 0;
+  #select: (key: string, value: string) => T;
+
+  constructor(
+    params: URLSearchParams,
+    select: (key: string, value: string) => T,
+  ) {
+    this.#params = params;
+    this.#select = select;
+  }
+
+  next(): IteratorResult<T> {
+    if (this.#index >= this.#params[_searchParamPairs].length) {
+      return { value: undefined, done: true };
+    }
+    // Mutations and URL updates can replace the entire parameter list.
+    const [key, value] = this.#params[_searchParamPairs][this.#index++];
+    return { value: this.#select(key, value), done: false };
+  }
+
+  [Symbol.iterator](): IterableIterator<T> {
+    return this;
+  }
+}
+
+Object.setPrototypeOf(
+  URLSearchParamsIterator.prototype,
+  Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())),
+);
+Object.defineProperty(URLSearchParamsIterator.prototype, "next", {
+  value: URLSearchParamsIterator.prototype.next,
+  writable: true,
+  enumerable: true,
+  configurable: true,
+});
+Object.defineProperty(URLSearchParamsIterator.prototype, Symbol.toStringTag, {
+  value: "URLSearchParams Iterator",
+  enumerable: false,
+  writable: false,
+  configurable: true,
+});
+
 class URLSearchParams {
   [_searchParamPairs]: [string, string][];
   // Reference back to the parent URL's `#updateUrl` method
   [_urlObjectUpdate]?: (update: { searchParams: [string, string][] }) => void;
   constructor(
-    init?: string[][] | Record<string, string> | string | URLSearchParams,
+    init?:
+      | Iterable<Iterable<string>>
+      | Record<string, string>
+      | string
+      | URLSearchParams,
   ) {
     this[_searchParamPairs] = [];
+    let iteratorMethod: any;
     if (init === undefined) {
       this[_searchParamPairs] = [];
     } else if (typeof init === "string") {
@@ -48,8 +103,20 @@ class URLSearchParams {
         "url/getUrlSearchParamPairs",
         queryString,
       );
-    } else if (Array.isArray(init)) {
-      for (const pair of init) {
+    } else if (
+      init !== null &&
+      (typeof init === "object" || typeof init === "function") &&
+      typeof (iteratorMethod = (init as any)[Symbol.iterator]) === "function"
+    ) {
+      // WebIDL sequence conversion reads @@iterator once; a getter may return
+      // a different value (or throw) on a second read.
+      const iterator: Iterator<Iterable<string>> = Reflect.apply(
+        iteratorMethod,
+        init,
+        [],
+      );
+      for (const rawPair of { [Symbol.iterator]: () => iterator }) {
+        const pair = [...rawPair];
         if (pair.length !== 2) {
           throw new TypeError(
             "Failed to construct 'URLSearchParams': Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements",
@@ -57,13 +124,16 @@ class URLSearchParams {
         }
         this.append(pair[0]!, pair[1]!);
       }
-    } else if (init instanceof URLSearchParams) {
-      init.forEach((value, key) => {
-        this.append(key, value);
-      });
     } else {
+      // WebIDL record conversion: keys become USVStrings, so keys that differ
+      // only in lone surrogates collapse into one entry, keeping the first
+      // key's position and the last key's value.
+      const record = new Map<string, string>();
       for (const key in init) {
-        this.append(key, init[key]!);
+        record.set(key.toWellFormed(), String(init[key]));
+      }
+      for (const [key, value] of record) {
+        this.append(key, value);
       }
     }
   }
@@ -77,19 +147,30 @@ class URLSearchParams {
   }
 
   append(name: string, value: string): void {
-    this[_searchParamPairs].push([String(name), String(value)]);
+    this[_searchParamPairs].push([
+      String(name).toWellFormed(),
+      String(value).toWellFormed(),
+    ]);
     this._updateUrl();
   }
 
-  delete(name: string) {
-    this[_searchParamPairs] = this[_searchParamPairs].filter(([key]) => {
-      return key !== String(name);
-    });
+  delete(name: string, value?: string) {
+    const n = String(name).toWellFormed();
+    const v = value === undefined ? undefined : String(value).toWellFormed();
+    this[_searchParamPairs] = this[_searchParamPairs].filter(
+      ([key, val]) => key !== n || (v !== undefined && val !== v),
+    );
     this._updateUrl();
+  }
+
+  #createIterator<T>(
+    select: (key: string, value: string) => T,
+  ): IterableIterator<T> {
+    return new URLSearchParamsIterator(this, select);
   }
 
   entries(): IterableIterator<[string, string]> {
-    return this[_searchParamPairs][Symbol.iterator]();
+    return this.#createIterator((key, value) => [key, value]);
   }
 
   forEach(
@@ -101,13 +182,14 @@ class URLSearchParams {
   }
 
   get(name: string): string | null {
-    return this.getAll(String(name))[0] ?? null;
+    return this.getAll(name)[0] ?? null;
   }
 
   getAll(name: string): string[] {
+    const n = String(name).toWellFormed();
     const values: string[] = [];
     for (const [key, value] of this[_searchParamPairs]) {
-      if (key === name) {
+      if (key === n) {
         values.push(value);
       }
     }
@@ -115,25 +197,42 @@ class URLSearchParams {
   }
 
   has(name: string): boolean {
-    return (
-      this[_searchParamPairs].find(([key]) => key === String(name)) !==
-      undefined
-    );
+    const n = String(name).toWellFormed();
+    return this[_searchParamPairs].find(([key]) => key === n) !== undefined;
   }
 
   keys(): IterableIterator<string> {
-    return this[_searchParamPairs].map(([key]) => key)[Symbol.iterator]();
+    return this.#createIterator((key) => key);
   }
 
   set(name: string, value: string) {
-    this.delete(name);
-    this.append(name, value);
+    name = String(name).toWellFormed();
+    value = String(value).toWellFormed();
+    let found = false;
+    this[_searchParamPairs] = this[_searchParamPairs].filter((pair) => {
+      if (pair[0] !== name) {
+        return true;
+      }
+      if (found) {
+        return false;
+      }
+      found = true;
+      pair[1] = value;
+      return true;
+    });
+    if (!found) {
+      this[_searchParamPairs].push([name, value]);
+    }
     this._updateUrl();
+  }
+
+  get size(): number {
+    return this[_searchParamPairs].length;
   }
 
   sort() {
     this[_searchParamPairs].sort((a, b) => {
-      return a[0].localeCompare(b[0]);
+      return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
     });
     this._updateUrl();
   }
@@ -147,15 +246,11 @@ class URLSearchParams {
   }
 
   [Symbol.iterator](): IterableIterator<[string, string]> {
-    return this.entries();
+    return this.#createIterator((key, value) => [key, value]);
   }
 
   values(): IterableIterator<string> {
-    return this[_searchParamPairs].map(([, value]) => value)[Symbol.iterator]();
-  }
-
-  get [Symbol.toStringTag]() {
-    return "URLSearchParams";
+    return this.#createIterator((_key, value) => value);
   }
 
   inspect() {
@@ -172,6 +267,13 @@ class URLSearchParams {
   }
 }
 
+Object.defineProperty(URLSearchParams.prototype, Symbol.toStringTag, {
+  value: "URLSearchParams",
+  enumerable: false,
+  writable: false,
+  configurable: true,
+});
+
 type UrlInfo = {
   scheme: string;
   hash: string;
@@ -183,6 +285,7 @@ type UrlInfo = {
   href: string;
   username: string;
   password: string;
+  origin: string;
 };
 
 class URL {
@@ -260,24 +363,17 @@ class URL {
   }
 
   get origin() {
-    switch (this.#urlInfo.scheme) {
-      case "ftp":
-      case "http":
-      case "https":
-      case "ws":
-      case "wss":
-        return `${this.#urlInfo.scheme}://${this.host}`;
-      default:
-        return "null";
-    }
+    return this.#urlInfo.origin;
   }
 
   get password() {
     return this.#urlInfo.password;
   }
 
-  set password(_password: string) {
-    throwNotImplementedMethodError("set password", "URL");
+  set password(password: string) {
+    this.#updateUrl({
+      password: `${password}`,
+    });
   }
 
   get pathname() {
@@ -332,8 +428,10 @@ class URL {
     return this.#urlInfo.username;
   }
 
-  set username(_username: string) {
-    throwNotImplementedMethodError("set username", "URL");
+  set username(username: string) {
+    this.#updateUrl({
+      username: `${username}`,
+    });
   }
 
   toString() {
@@ -354,10 +452,6 @@ class URL {
     this.#searchParams[_searchParamPairs] = searchPairs;
   }
 
-  get [Symbol.toStringTag]() {
-    return "URL";
-  }
-
   inspect() {
     const object = {
       href: this.href,
@@ -375,6 +469,13 @@ class URL {
     return `${this.constructor.name} ${inspect(object)}`;
   }
 }
+
+Object.defineProperty(URL.prototype, Symbol.toStringTag, {
+  value: "URL",
+  enumerable: false,
+  writable: false,
+  configurable: true,
+});
 
 export const setupURL = (global: any) => {
   global.URL = URL;

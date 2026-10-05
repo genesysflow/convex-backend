@@ -1,16 +1,25 @@
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import {
+  createOpenAICompatible,
+  type MetadataExtractor,
+} from "@ai-sdk/openai-compatible";
 import {
   defaultSettingsMiddleware,
   wrapEmbeddingModel,
   wrapLanguageModel,
 } from "ai";
 import { getServiceToken } from "convex/server";
+import { createEvaluationModel } from "./evaluation-model.js";
+import { createVideoModel } from "./video-model.js";
 
 type Provider = ReturnType<typeof createOpenAICompatible>;
 type ChatModel = ReturnType<Provider>;
-type EmbeddingModel = ReturnType<Provider["embeddingModel"]>;
+type EmbeddingModel = ReturnType<typeof wrapEmbeddingModel>;
+type ProviderMetadata = NonNullable<
+  Awaited<ReturnType<MetadataExtractor["extractMetadata"]>>
+>;
+type ImageModel = ReturnType<Provider["imageModel"]>;
 type LanguageModel = Parameters<typeof wrapLanguageModel>[0]["model"];
 type GatewayLanguageModel = ReturnType<typeof wrapLanguageModel>;
 
@@ -24,19 +33,14 @@ const placeholderCredential = "convex-gateway";
  */
 const productionGatewayHost = "https://ai-gateway.convex.dev";
 
-function gatewayBaseURL(): string {
-  return `${process.env.CONVEX_INTERNAL_AI_GATEWAY_HOST || productionGatewayHost}/v1`;
+function gatewayBaseURL(version: "v1" | "alpha" = "v1"): string {
+  return `${process.env.CONVEX_INTERNAL_AI_GATEWAY_HOST || productionGatewayHost}/${version}`;
 }
 
 async function gatewayFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
-  if (typeof getServiceToken !== "function") {
-    throw new Error(
-      "@convex-dev/ai-sdk-provider requires convex >= 1.45 with getServiceToken support",
-    );
-  }
   const token = await getServiceToken("ai-gateway");
   const headers = new Headers(init?.headers);
   // Deployment JWT is the only accepted credential for the hosted gateway.
@@ -44,11 +48,46 @@ async function gatewayFetch(
   return globalThis.fetch(input, { ...init, headers });
 }
 
-function createGatewayProvider(): Provider {
+// The SDK's standard usage mapping omits the gateway's dollar costs.
+function convexGatewayUsageMetadata(
+  usage: unknown,
+): ProviderMetadata | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const { cost, cost_details } = usage as ProviderMetadata[string];
+  const metadata: ProviderMetadata[string] = {};
+  if (typeof cost === "number") metadata.cost = cost;
+  if (cost_details && typeof cost_details === "object") {
+    metadata.costDetails = cost_details;
+  }
+  return Object.keys(metadata).length > 0
+    ? { convexGateway: metadata }
+    : undefined;
+}
+
+const costMetadataExtractor: MetadataExtractor = {
+  extractMetadata: async ({ parsedBody }) =>
+    convexGatewayUsageMetadata(
+      (parsedBody as { usage?: unknown } | undefined)?.usage,
+    ),
+  createStreamExtractor: () => {
+    // Streamed responses deliver usage (incl. cost) on the final chunk.
+    let usage: unknown;
+    return {
+      processChunk(parsedChunk: unknown) {
+        const chunk = parsedChunk as { usage?: unknown } | undefined;
+        if (chunk?.usage) usage = chunk.usage;
+      },
+      buildMetadata: () => convexGatewayUsageMetadata(usage),
+    };
+  },
+};
+
+function createGatewayProvider(fetch = gatewayFetch): Provider {
   return createOpenAICompatible({
     name: "convexGateway",
     baseURL: gatewayBaseURL(),
-    fetch: gatewayFetch,
+    fetch,
+    metadataExtractor: costMetadataExtractor,
     supportsStructuredOutputs: true,
     supportedUrls: () => ({ "image/*": [/^https?:\/\/.*$/] }),
   });
@@ -93,8 +132,8 @@ function gatewayLanguageModel(
  * The recommended model interface for text generation through the Convex AI gateway.
  * Use `messages` or `responses` only for endpoint-specific features.
  *
- * `getServiceToken` reuses one token for the current action, so calling this
- * more than once in the same action is fine.
+ * `getServiceToken` caches and refreshes credentials within the current action,
+ * so calling this more than once in the same action is fine.
  */
 export function convexGateway(modelId: string): ChatModel {
   return createGatewayProvider()(modelId);
@@ -129,6 +168,16 @@ convexGateway.responses = function (modelId: string): GatewayLanguageModel {
   );
 };
 
+/** Evaluate typed questions through the alpha Decisions API. */
+convexGateway.evaluationModel = function (modelId: string) {
+  return createEvaluationModel(
+    modelId,
+    gatewayBaseURL("alpha"),
+    gatewayFetch,
+    convexGatewayUsageMetadata,
+  );
+};
+
 convexGateway.embeddingModel = function (modelId: string): EmbeddingModel {
   return wrapEmbeddingModel({
     model: createGatewayProvider().embeddingModel(modelId),
@@ -138,3 +187,53 @@ convexGateway.embeddingModel = function (modelId: string): EmbeddingModel {
     },
   });
 };
+
+/** Image model for the AI SDK's `generateImage`. */
+convexGateway.imageModel = function (modelId: string): ImageModel {
+  const { specificationVersion, provider, maxImagesPerCall } =
+    createGatewayProvider().imageModel(modelId);
+  return {
+    specificationVersion,
+    provider,
+    modelId,
+    maxImagesPerCall,
+    async doGenerate(options) {
+      if (options.files?.length || options.mask) {
+        throw new Error(
+          "Convex AI Gateway does not support image editing. Use a text prompt without input images or a mask.",
+        );
+      }
+      // The SDK's image adapter discards `usage` and has no metadata hook, so
+      // each call reads it from its own response through a per-call fetch.
+      let usage: unknown;
+      const model = createGatewayProvider(async (input, init) => {
+        const response = await gatewayFetch(input, init);
+        if (response.ok) {
+          usage = (await response.clone().json()).usage;
+        }
+        return response;
+      }).imageModel(modelId);
+      const result = await model.doGenerate(options);
+      const metadata = convexGatewayUsageMetadata(usage)?.convexGateway;
+      return {
+        ...result,
+        ...(metadata && {
+          // The SDK's image metadata type requires a per-image `images` array.
+          providerMetadata: { convexGateway: { ...metadata, images: [] } },
+        }),
+      };
+    },
+  };
+};
+
+/** Video generation for the AI SDK's `experimental_generateVideo`. */
+convexGateway.videoModel = function (modelId: string) {
+  return createVideoModel(
+    modelId,
+    gatewayBaseURL(),
+    gatewayFetch,
+    convexGatewayUsageMetadata,
+  );
+};
+
+export { verifyVideoWebhook, type VideoWebhookEvent } from "./video-webhook.js";

@@ -96,6 +96,8 @@ use common::{
         DATABASE_UDF_USER_TIMEOUT,
         FUNCTION_MAX_ARGS_SIZE,
         FUNCTION_MAX_RESULT_SIZE,
+        TRANSACTION_MAX_FILE_WRITE_SIZE_BYTES,
+        TRANSACTION_MAX_NUM_FILES_WRITTEN,
         TRANSACTION_MAX_NUM_SCHEDULED,
         TRANSACTION_MAX_NUM_USER_WRITES,
         TRANSACTION_MAX_READ_SET_INTERVALS,
@@ -183,7 +185,9 @@ use crate::{
         },
         AsyncOpRequest,
         JsEnvironment,
+        OpProvider,
         SyscallProvider,
+        UncatchableDeveloperError,
     },
     helpers::{
         self,
@@ -256,7 +260,7 @@ fn not_allowed_in_udf(name: &str, description: &str) -> ErrorMetadata {
     )
 }
 
-impl<RT: Runtime> SyscallProvider<RT> for DatabaseUdfSyscallProvider<RT> {
+impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
     fn trace(&mut self, level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         self.emit_log_line(LogLine::new_developer_log_line(
             level,
@@ -309,7 +313,9 @@ impl<RT: Runtime> SyscallProvider<RT> for DatabaseUdfSyscallProvider<RT> {
         let tx = self.phase.tx()?;
         Ok(tx.table_mapping().namespace(namespace))
     }
+}
 
+impl<RT: Runtime> SyscallProvider<RT> for DatabaseUdfSyscallProvider<RT> {
     async fn lookup_source(
         &mut self,
         path: &str,
@@ -1205,7 +1211,22 @@ where
                 scope!(let result_scope, &mut *scope);
                 let result_v8 = match result {
                     Ok(v) => Ok(serde_v8::to_v8(result_scope, v)?),
-                    Err(e) => Err(e),
+                    Err(e) => match e.downcast::<UncatchableDeveloperError>() {
+                        // Ends the function before any JS sees this result,
+                        // which is what makes it uncatchable.
+                        Ok(UncatchableDeveloperError { message }) => {
+                            report_error_sync(&mut anyhow::anyhow!(
+                                "UncatchableDeveloperError: {message}"
+                            ));
+                            handle.terminate_and_throw(
+                                ContextTerminationReason::UncatchableDeveloperError(
+                                    JsError::from_message(message),
+                                )
+                                .into(),
+                            )?;
+                        },
+                        Err(e) => Err(e),
+                    },
                 };
                 resolve_promise(result_scope, resolver, result_v8)?;
             }
@@ -1461,6 +1482,28 @@ pub fn add_warnings_to_log_lines(
     if let Some(warning) = scheduled_arg_size_warning(
         execution_size.scheduled_size.max_args_size,
         &system_udf_path,
+    ) {
+        trace_system_warning(warning);
+    }
+    if let Some(warning) = approaching_limit_warning(
+        execution_size.file_storage_write_size.num_writes,
+        *TRANSACTION_MAX_NUM_FILES_WRITTEN,
+        "TooManyFilesWritten",
+        || "Many files stored by this mutation".to_string(),
+        None,
+        None,
+        system_udf_path.as_ref(),
+    ) {
+        trace_system_warning(warning);
+    }
+    if let Some(warning) = approaching_limit_warning(
+        execution_size.file_storage_write_size.size,
+        *TRANSACTION_MAX_FILE_WRITE_SIZE_BYTES,
+        "FilesWrittenTooLarge",
+        || "Large total size of the files stored by this mutation".to_string(),
+        None,
+        Some(" bytes"),
+        system_udf_path.as_ref(),
     ) {
         trace_system_warning(warning);
     }

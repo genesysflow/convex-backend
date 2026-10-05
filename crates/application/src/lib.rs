@@ -144,6 +144,7 @@ use common::{
         FunctionCaller,
         IndexId,
         IndexName,
+        IndexRef,
         ModuleEnvironment,
         NodeDependency,
         ObjectKey,
@@ -330,11 +331,11 @@ use roles::RequireDeploymentOp;
 use scheduled_jobs::ScheduledJobRunner;
 use schema_worker::SchemaWorker;
 use search::{
-    query::RevisionWithKeys,
     searcher::{
         Searcher,
         SegmentTermMetadataFetcher,
     },
+    TextSearchResults,
 };
 use search_index_workers::{
     FastForwardIndexWorker,
@@ -418,6 +419,7 @@ use crate::{
         RedactedJsError,
         RedactedLogLines,
     },
+    s3_export_worker::S3ExportWorker,
     snapshot_import::{
         clear_tables,
         SnapshotImportWorker,
@@ -441,6 +443,7 @@ pub mod log_streaming;
 pub mod log_visibility;
 mod metrics;
 pub mod redaction;
+mod s3_export_worker;
 pub mod scheduled_jobs;
 mod schema_worker;
 pub mod snapshot_import;
@@ -646,6 +649,22 @@ pub async fn create_storage<RT: Runtime>(
 
 const DEFAULT_AUDIT_LOG_LIMIT: usize = 15;
 const MAX_AUDIT_LOG_LIMIT: usize = 100;
+
+fn ensure_export_file_storage_within_limit(
+    format: ExportFormat,
+    latest_file_storage_size: Option<u64>,
+) -> anyhow::Result<()> {
+    if matches!(
+        format,
+        ExportFormat::Zip {
+            include_storage: true
+        }
+    ) && let Some(file_storage_size) = latest_file_storage_size
+    {
+        ::exports::ensure_file_storage_export_size(file_storage_size)?;
+    }
+    Ok(())
+}
 
 impl<RT: Runtime> Application<RT> {
     pub async fn initialize_storage(
@@ -893,6 +912,16 @@ impl<RT: Runtime> Application<RT> {
             runtime.spawn("cron_job_executor", cron_job_executor_fut),
         ));
 
+        let s3_export_worker = S3ExportWorker::new(
+            runtime.clone(),
+            database.clone(),
+            deployment_name.clone(),
+            export_provider.clone(),
+        );
+        let s3_export_worker = Arc::new(Mutex::new(Some(
+            runtime.spawn("s3_export_worker", s3_export_worker.run()),
+        )));
+
         let export_worker = ExportWorker::new(
             runtime.clone(),
             database.clone(),
@@ -947,6 +976,7 @@ impl<RT: Runtime> Application<RT> {
             schema_worker,
             snapshot_import_worker,
             export_worker,
+            s3_export_worker,
             system_table_cleanup_worker,
             migration_worker,
             usage_limit_worker,
@@ -999,8 +1029,11 @@ impl<RT: Runtime> Application<RT> {
         &self,
         identity: &Identity,
         claims: AttributionClaims,
+        request_id: &RequestId,
     ) -> anyhow::Result<String> {
-        self.runner.mint_ai_gateway_jwt(identity, claims).await
+        self.runner
+            .mint_ai_gateway_jwt(identity, claims, request_id)
+            .await
     }
 
     pub fn metrics_log(&self, identity: &Identity) -> anyhow::Result<FunctionMetricsLog<'_, RT>> {
@@ -1123,7 +1156,7 @@ impl<RT: Runtime> Application<RT> {
     pub async fn index_page(
         &self,
         ts: RepeatableTimestamp,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         interval: &Interval,
         order: Order,
@@ -1133,7 +1166,7 @@ impl<RT: Runtime> Application<RT> {
         CursorPosition,
     )> {
         self.database
-            .index_page(ts, index_id, tablet_id, interval, order, max_size)
+            .index_page(ts, index, tablet_id, interval, order, max_size)
             .await
     }
 
@@ -1169,7 +1202,7 @@ impl<RT: Runtime> Application<RT> {
         query: pb::searchlight::TextQuery,
         pending_updates: Vec<DocumentUpdate>,
         ts: RepeatableTimestamp,
-    ) -> anyhow::Result<RevisionWithKeys> {
+    ) -> anyhow::Result<TextSearchResults> {
         self.database
             .text_search_at_ts(index_id, printable_index_name, query, pending_updates, ts)
             .await
@@ -1633,6 +1666,12 @@ impl<RT: Runtime> Application<RT> {
         expiration_ts_ns: Option<u64>,
     ) -> anyhow::Result<DeveloperDocumentId> {
         identity.require_operation(DeploymentOp::CreateBackups)?;
+        ensure_export_file_storage_within_limit(
+            format,
+            self.workers
+                .usage_gauges_tracking_worker
+                .latest_file_storage_size(),
+        )?;
         if let Some(expiration_ts_ns) = expiration_ts_ns {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2677,6 +2716,13 @@ impl<RT: Runtime> Application<RT> {
         caller: FunctionCaller,
         component: ComponentId,
     ) -> anyhow::Result<Result<FunctionReturn, FunctionError>> {
+        anyhow::ensure!(
+            module.environment == ModuleEnvironment::Isolate,
+            ErrorMetadata::bad_request(
+                "InvalidTestQueryEnvironment",
+                "Test queries must use the Convex runtime.",
+            ),
+        );
         let request_id = request_context.request_id.clone();
         let block_logging = self
             .log_visibility

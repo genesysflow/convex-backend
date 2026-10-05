@@ -34,7 +34,6 @@ use common::{
         PendingDocumentUpdate,
         ResolvedDocument,
     },
-    errors::report_error,
     identity::InertIdentity,
     index::{
         IndexKey,
@@ -45,7 +44,6 @@ use common::{
         IntervalSet,
     },
     knobs::{
-        PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED,
         SEARCH_INDEX_SIZE_SOFT_LIMIT,
         TEXT_INDEX_SIZE_HARD_LIMIT,
         VECTOR_INDEX_SIZE_HARD_LIMIT,
@@ -93,6 +91,7 @@ use keybroker::{
 use search::{
     metrics::SearchType,
     CandidateRevision,
+    TextSearchResults,
 };
 use sync_types::{
     AuthenticationToken,
@@ -122,9 +121,14 @@ use crate::{
     },
     committer::table_dependency_sort_key,
     execution_size::{
+        FileStorageReadSize,
         FunctionExecutionSize,
         ScheduledFunctionsSize,
         TransactionLimits,
+    },
+    file_uploads::{
+        FileUploads,
+        PendingFileUpload,
     },
     metrics::{
         self,
@@ -175,6 +179,11 @@ pub struct Transaction<RT: Runtime> {
     // Size of any functions scheduled from this transaction.
     pub scheduled_size: ScheduledFunctionsSize,
 
+    // Size of the file storage accessed from this transaction.
+    pub file_storage_read_size: FileStorageReadSize,
+
+    pub(crate) file_uploads: NestedWrites<FileUploads>,
+
     // Transaction limits (reads, writes, scheduled). Defaults to global limits.
     pub(crate) limits: TransactionLimits,
 
@@ -213,9 +222,13 @@ pub struct SubtransactionToken {
     tables: NestedWriteToken,
     schema_registry: NestedWriteToken,
     component_registry: NestedWriteToken,
+    file_uploads: NestedWriteToken,
     /// Parent's transaction limits, restored when the subtransaction
     /// commits or rolls back.
     limits: TransactionLimits,
+    /// Parent's table count deltas, restored when the subtransaction rolls
+    /// back.
+    table_count_deltas: BTreeMap<TabletId, i64>,
 }
 
 impl<RT: Runtime> Transaction<RT> {
@@ -239,6 +252,8 @@ impl<RT: Runtime> Transaction<RT> {
             id_generator,
             next_creation_time: creation_time,
             scheduled_size: ScheduledFunctionsSize::default(),
+            file_storage_read_size: FileStorageReadSize::default(),
+            file_uploads: NestedWrites::new(FileUploads::default()),
             limits: TransactionLimits::default(),
             index: NestedWrites::new(index),
             metadata: NestedWrites::new(metadata),
@@ -271,9 +286,6 @@ impl<RT: Runtime> Transaction<RT> {
     }
 
     pub(crate) async fn assign_missing_persistence_index_ids(&mut self) -> anyhow::Result<()> {
-        if !*PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED {
-            return Ok(());
-        }
         let writes = self.writes.as_flat()?;
         let mut missing_index_id_updates = Vec::new();
         for id in writes.new_index_document_ids() {
@@ -300,17 +312,10 @@ impl<RT: Runtime> Transaction<RT> {
         if missing_index_id_updates.is_empty() {
             return Ok(());
         }
-        let persistence_index_ids = match NextPersistenceIndexIdModel::new(self)
+        let persistence_index_ids = NextPersistenceIndexIdModel::new(self)
             .allocate(missing_index_id_updates.len())
             .await
-        {
-            Ok(index_ids) => index_ids,
-            Err(mut err) => {
-                err = err.context("Failed to allocate persistence index IDs");
-                report_error(&mut err).await;
-                return Ok(());
-            },
-        };
+            .context("Failed to allocate persistence index IDs")?;
 
         for ((id, mut metadata), persistence_index_id) in missing_index_id_updates
             .into_iter()
@@ -397,6 +402,10 @@ impl<RT: Runtime> Transaction<RT> {
         self.index.base_snapshot().timestamp()
     }
 
+    pub fn next_creation_time(&self) -> CreationTime {
+        self.next_creation_time
+    }
+
     pub fn index_registry(&self) -> &indexing::index_registry::IndexRegistry {
         self.index.index_registry()
     }
@@ -412,7 +421,9 @@ impl<RT: Runtime> Transaction<RT> {
             tables: self.metadata.begin_nested(),
             schema_registry: self.schema_registry.begin_nested(),
             component_registry: self.component_registry.begin_nested(),
+            file_uploads: self.file_uploads.begin_nested(),
             limits: self.limits.clone(),
+            table_count_deltas: self.table_count_deltas.clone(),
         }
     }
 
@@ -423,6 +434,7 @@ impl<RT: Runtime> Transaction<RT> {
         self.schema_registry.commit_nested(tokens.schema_registry)?;
         self.component_registry
             .commit_nested(tokens.component_registry)?;
+        self.file_uploads.commit_nested(tokens.file_uploads)?;
         self.limits = tokens.limits;
         Ok(())
     }
@@ -435,7 +447,9 @@ impl<RT: Runtime> Transaction<RT> {
             .rollback_nested(tokens.schema_registry)?;
         self.component_registry
             .rollback_nested(tokens.component_registry)?;
+        self.file_uploads.rollback_nested(tokens.file_uploads)?;
         self.limits = tokens.limits;
+        self.table_count_deltas = tokens.table_count_deltas;
         Ok(())
     }
 
@@ -445,6 +459,7 @@ impl<RT: Runtime> Transaction<RT> {
         self.metadata.require_not_nested()?;
         self.schema_registry.require_not_nested()?;
         self.component_registry.require_not_nested()?;
+        self.file_uploads.require_not_nested()?;
         Ok(())
     }
 
@@ -491,7 +506,25 @@ impl<RT: Runtime> Transaction<RT> {
             read_size: self.reads.user_tx_size().to_owned(),
             write_size: self.writes.user_size().to_owned(),
             scheduled_size: self.scheduled_size.clone(),
+            file_storage_write_size: self.file_uploads.size(),
+            file_storage_read_size: self.file_storage_read_size.clone(),
         }
+    }
+
+    /// Records the contents of a file whose `_file_storage` row `id` this
+    /// transaction just wrote.
+    pub fn add_pending_file_upload(
+        &mut self,
+        id: ResolvedDocumentId,
+        upload: PendingFileUpload,
+    ) -> anyhow::Result<()> {
+        self.file_uploads.add_pending(id, upload)
+    }
+
+    /// Forgets the file whose `_file_storage` row `id` this transaction just
+    /// deleted, if it was one the transaction stored.
+    pub fn remove_pending_file_upload(&mut self, id: &ResolvedDocumentId) -> anyhow::Result<()> {
+        self.file_uploads.remove_pending(id)
     }
 
     /// Returns the transaction limits.
@@ -880,6 +913,13 @@ impl<RT: Runtime> Transaction<RT> {
             .get_component_path(component_id, &mut self.reads)
     }
 
+    /// Resolves the path without recording the lookup in this transaction's
+    /// read set, for logging and diagnostics only.
+    pub fn get_component_path_untracked(&self, component_id: ComponentId) -> Option<ComponentPath> {
+        self.component_registry
+            .get_component_path(component_id, &mut TransactionReadSet::new())
+    }
+
     pub fn must_component_path(
         &mut self,
         component_id: ComponentId,
@@ -1192,9 +1232,10 @@ impl<RT: Runtime> Transaction<RT> {
         }
         let bootstrap_tables = self.bootstrap_tables();
         let old_document = old_document_and_ts.as_ref().map(|(doc, _)| doc);
-        let index_update = self
-            .index
-            .begin_update(old_document.cloned(), new_document_view.as_deref().cloned())?;
+        let index_update = self.index.begin_update(
+            old_document_and_ts.clone(),
+            new_document_view.as_deref().cloned(),
+        )?;
         let schema_update = self.schema_registry.begin_update(
             self.metadata.table_mapping(),
             id,
@@ -1310,14 +1351,21 @@ impl<RT: Runtime> Transaction<RT> {
             .index_registry()
             .require_enabled(tablet_index_name, &index_name)?;
         let index_size = index.metadata().config.estimate_pricing_size_bytes()?;
-        let results = self
+        let TextSearchResults {
+            revisions_with_keys,
+            filtered_bytes_searched,
+        } = self
             .index
             .search(&mut self.reads, &search, tablet_index_name.clone(), version)
             .await?;
 
-        self.usage_tracker
-            .track_text_query(component_path, index_name, index_size);
-        Ok(results)
+        self.usage_tracker.track_text_query(
+            component_path,
+            index_name,
+            index_size,
+            filtered_bytes_searched,
+        );
+        Ok(revisions_with_keys)
     }
 
     // Preload an index range against the transaction, building a snapshot of
@@ -1373,6 +1421,8 @@ impl<RT: Runtime> Transaction<RT> {
             id_generator: self.id_generator.clone_for_snapshot_query(),
             next_creation_time: self.next_creation_time,
             scheduled_size: self.scheduled_size.clone(),
+            file_storage_read_size: self.file_storage_read_size.clone(),
+            file_uploads: NestedWrites::new(FileUploads::default()),
             limits: self.limits.clone(),
             // Don't clone the read set because it is expensive and doesn't matter in a snapshot
             // query

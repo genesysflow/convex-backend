@@ -20,7 +20,6 @@ pub mod schema;
 pub mod udf;
 
 use common::{
-    errors::JsError,
     log_lines::LogLevel,
     runtime::{
         Runtime,
@@ -88,17 +87,9 @@ pub trait JsEnvironment<RT: Runtime>: 'static {
     fn system_timeout(&self) -> Duration;
 }
 
-/// Gives access to the syscalls, ops, and module loading used by the isolate.
-#[allow(async_fn_in_trait)]
-pub trait SyscallProvider<RT: Runtime>: 'static {
-    async fn lookup_source(
-        &mut self,
-        path: &str,
-        timeout: &mut Timeout<RT>,
-    ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>>;
-
-    fn syscall(&mut self, name: &str, args: JsonValue) -> anyhow::Result<JsonValue>;
-
+/// What an op can reach for: the seed, the clock, the transaction, the
+/// environment.
+pub trait OpProvider {
     fn trace(&mut self, level: LogLevel, messages: Vec<String>) -> anyhow::Result<()>;
     fn rng(&mut self) -> anyhow::Result<&mut ChaCha12Rng>;
     fn crypto_rng(&mut self) -> anyhow::Result<CryptoRng>;
@@ -110,6 +101,19 @@ pub trait SyscallProvider<RT: Runtime>: 'static {
         -> anyhow::Result<Option<EnvVarValue>>;
 
     fn get_all_table_mappings(&mut self) -> anyhow::Result<NamespacedTableMapping>;
+}
+
+/// [`OpProvider`] plus what only the V8 syscall layer needs: the module source
+/// an import resolves to, and the syscalls themselves.
+#[allow(async_fn_in_trait)]
+pub trait SyscallProvider<RT: Runtime>: OpProvider + 'static {
+    async fn lookup_source(
+        &mut self,
+        path: &str,
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>>;
+
+    fn syscall(&mut self, name: &str, args: JsonValue) -> anyhow::Result<JsonValue>;
 }
 
 /// A [`JsEnvironment`] that can run inside V8, i.e. one whose async
@@ -126,10 +130,14 @@ impl<RT: Runtime, E> V8IsolateEnvironment<RT> for E where
 {
 }
 
+/// An uncatchable developer error thrown from an op or provider.
+///
+/// This is caught by the syscall or op boundary, which captures the JS stack
+/// (if any) at that point and ends the function with it.
 #[derive(Debug, thiserror::Error)]
-#[error("UncatchableDeveloperError")]
+#[error("{message}")]
 pub struct UncatchableDeveloperError {
-    pub js_error: JsError,
+    pub message: String,
 }
 
 pub enum ModuleCodeCacheResult {
@@ -137,10 +145,12 @@ pub enum ModuleCodeCacheResult {
     /// The module isn't cached; it can be populated by calling the callback
     /// with the generated CachedData.
     Uncached(Box<dyn FnOnce(Arc<[u8]>)>),
+    /// The module isn't cached, and the cache shouldn't be populated.
+    Disabled,
 }
 
 impl ModuleCodeCacheResult {
     pub fn noop() -> Self {
-        ModuleCodeCacheResult::Uncached(Box::new(|_| ()))
+        ModuleCodeCacheResult::Disabled
     }
 }

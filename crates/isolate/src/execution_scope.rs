@@ -401,7 +401,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
                     ),
                     v8::script_compiler::CompileOptions::ConsumeCodeCache,
                 ),
-                ModuleCodeCacheResult::Uncached(_) => (
+                ModuleCodeCacheResult::Uncached(_) | ModuleCodeCacheResult::Disabled => (
                     v8::script_compiler::Source::new(source_str, Some(&origin)),
                     v8::script_compiler::CompileOptions::NoCompileOptions,
                 ),
@@ -436,6 +436,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
                         timer.finish();
                     }
                 },
+                ModuleCodeCacheResult::Disabled => {},
             }
 
             assert_eq!(module.get_status(), v8::ModuleStatus::Uninstantiated);
@@ -533,7 +534,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
                 .ok_or_else(|| SystemModuleNotFoundError::new(system_path))?;
             let result = V8ModuleSource::new(FullModuleSource {
                 source: source.into(),
-                source_map: source_map.as_ref().map(|s| s.to_string()),
+                source_map: source_map.map(Into::into),
             });
             timer.finish();
             // TODO: should we code-cache system UDFs?
@@ -625,7 +626,8 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
         match Self::_module_resolve_callback(scope, referrer, specifier) {
             Ok(m) => Some(m),
             Err(e) => {
-                helpers::throw_type_error(scope, format!("{e:?}"));
+                // Display keeps Rust backtraces out of the developer's error.
+                helpers::throw_type_error(scope, format!("{e}"));
                 None
             },
         }

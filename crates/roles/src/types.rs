@@ -212,6 +212,10 @@ pub enum RolePolicyAction {
     UpdateDeploymentType(DeploymentId),
     DeleteDeployment(DeploymentId),
     ViewDeployments(DeploymentId),
+    UseAiGateway {
+        project_id: ProjectId,
+        owner: MemberId,
+    },
     /// Read access to deployment-scoped integration metadata (e.g. WorkOS
     /// environment association). Granted to any team member.
     ViewDeploymentIntegrations(DeploymentId),
@@ -248,6 +252,12 @@ pub enum RolePolicyAction {
     ViewInvoices,
     // Audit Log
     ViewTeamAuditLog,
+    // Team Domains — the domains the team has claimed in WorkOS, shared by SSO
+    // and directory sync. Creation happens in the WorkOS admin portal, so
+    // `CreateTeamDomain` gates the portal link rather than a write of ours.
+    CreateTeamDomain,
+    DeleteTeamDomain,
+    ViewTeamDomains,
     // Team Access Tokens
     CreateTeamAccessToken {
         creator: Option<MemberId>,
@@ -374,6 +384,11 @@ pub enum ActionResourcePath {
         deployment_type: DeploymentType,
         creator: Option<MemberId>,
     },
+    /// `[Project(loaded by id), LocalDeployment { owner }]`.
+    LocalDeploymentInProject {
+        project_id: ProjectId,
+        owner: MemberId,
+    },
     /// `[Team, Token(ConcreteToken { creator })]`.
     TeamToken { creator: Option<MemberId> },
     /// `[Project(loaded by id), Token(ConcreteToken { creator })]`.
@@ -408,6 +423,9 @@ impl RolePolicyAction {
             | P::DeleteTeam
             | P::ApplyReferralCode
             | P::ViewTeamAuditLog
+            | P::CreateTeamDomain
+            | P::DeleteTeamDomain
+            | P::ViewTeamDomains
             | P::ViewUsage => Path::Singleton(ResourceKind::Team),
             // Billing singletons.
             P::UpdatePaymentMethod
@@ -479,6 +497,10 @@ impl RolePolicyAction {
             | P::DisablePeriodicBackups(id)
             | P::DeleteBackups(id)
             | P::ViewBackups(id) => Path::Deployment(*id),
+            P::UseAiGateway { project_id, owner } => Path::LocalDeploymentInProject {
+                project_id: *project_id,
+                owner: *owner,
+            },
             // Project create / receive — synthesize a proposed-project
             // segment on the destination team. Receive can't use
             // `Path::Project(id)` because the project still belongs to the
@@ -622,6 +644,9 @@ impl RolePolicyAction {
             P::ViewBillingDetails => S::ViewBillingDetails,
             P::ViewInvoices => S::ViewInvoices,
             P::ViewTeamAuditLog => S::ViewTeamAuditLog,
+            P::CreateTeamDomain => S::CreateTeamDomain,
+            P::DeleteTeamDomain => S::DeleteTeamDomain,
+            P::ViewTeamDomains => S::ViewTeamDomains,
             P::CreateTeamAccessToken { .. } => S::CreateTeamAccessToken,
             P::UpdateTeamAccessToken { .. } => S::UpdateTeamAccessToken,
             P::DeleteTeamAccessToken { .. } => S::DeleteTeamAccessToken,
@@ -640,6 +665,7 @@ impl RolePolicyAction {
             P::ViewOAuthApplications => S::ViewOAuthApplications,
             P::GenerateOAuthClientSecret => S::GenerateOAuthClientSecret,
             P::ViewUsage => S::ViewUsage,
+            P::UseAiGateway { .. } => S::UseAiGateway,
             P::ViewInsights(_) => S::ViewInsights,
             P::CreateBackups(_) => S::CreateBackups,
             P::ImportBackups(_) => S::ImportBackups,
@@ -812,6 +838,16 @@ pub enum RoleStatementAction {
     #[serde(rename = "team:auditLog:view")]
     #[strum(serialize = "team:auditLog:view")]
     ViewTeamAuditLog,
+    // Team Domains
+    #[serde(rename = "team:domain:create")]
+    #[strum(serialize = "team:domain:create")]
+    CreateTeamDomain,
+    #[serde(rename = "team:domain:delete")]
+    #[strum(serialize = "team:domain:delete")]
+    DeleteTeamDomain,
+    #[serde(rename = "team:domain:view")]
+    #[strum(serialize = "team:domain:view")]
+    ViewTeamDomains,
     // Team Access Tokens
     #[serde(rename = "team:token:create")]
     #[strum(serialize = "team:token:create")]
@@ -999,6 +1035,9 @@ pub enum RoleStatementAction {
     #[serde(rename = "deployment:usage:view")]
     #[strum(serialize = "deployment:usage:view")]
     ViewDeploymentUsage,
+    /// Mint an AI gateway credential from an action running on the
+    /// deployment. Only checked for identities that carry an op set: deploy
+    /// keys and dashboard members.
     #[serde(rename = "deployment:aiGateway:use")]
     #[strum(serialize = "deployment:aiGateway:use")]
     UseAiGateway,
@@ -1009,9 +1048,13 @@ impl RoleStatementAction {
         use RoleStatementAction as A;
         match self {
             // Team
-            A::UpdateTeam | A::DeleteTeam | A::ViewTeamAuditLog | A::ViewUsage => {
-                ResourceKind::Team
-            },
+            A::UpdateTeam
+            | A::DeleteTeam
+            | A::ViewTeamAuditLog
+            | A::CreateTeamDomain
+            | A::DeleteTeamDomain
+            | A::ViewTeamDomains
+            | A::ViewUsage => ResourceKind::Team,
             // Billing
             A::UpdatePaymentMethod
             | A::UpdateBillingContact
@@ -1358,6 +1401,11 @@ pub enum ConcreteSegment {
         deployment_type: DeploymentType,
         creator: Option<MemberId>,
     },
+    /// An existing local deployment. For role matching it behaves as a Dev
+    /// deployment, has no cloud deployment id, and is created by `owner`.
+    LocalDeployment {
+        owner: MemberId,
+    },
     Member,
     Token(ConcreteToken),
     CustomRole,
@@ -1376,9 +1424,9 @@ impl ConcreteSegment {
             ConcreteSegment::Project(_) | ConcreteSegment::ProposedProject { .. } => {
                 ResourceKind::Project
             },
-            ConcreteSegment::Deployment(_) | ConcreteSegment::ProposedDeployment { .. } => {
-                ResourceKind::Deployment
-            },
+            ConcreteSegment::Deployment(_)
+            | ConcreteSegment::ProposedDeployment { .. }
+            | ConcreteSegment::LocalDeployment { .. } => ResourceKind::Deployment,
             ConcreteSegment::Member => ResourceKind::Member,
             ConcreteSegment::Token(_) => ResourceKind::Token,
             ConcreteSegment::CustomRole => ResourceKind::CustomRole,
@@ -1422,6 +1470,9 @@ impl ConcreteSegment {
                     None => "none".to_string(),
                 };
                 Some(format!("type={deployment_type}, creator={creator}"))
+            },
+            ConcreteSegment::LocalDeployment { owner } => {
+                Some(format!("type=dev, creator={owner}"))
             },
             ConcreteSegment::Token(t) => {
                 let creator = match t.creator {

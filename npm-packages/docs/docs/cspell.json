@@ -1,5 +1,7 @@
 {
   "words": [
+    "oxlint",
+    "oxlintrc",
     "agentic",
     "airbyte",
     "Airbyte",
@@ -24,8 +26,10 @@
     "codegen",
     "codemod",
     "codestral",
+    "contravariantly",
     "convexapp",
     "convexmobile",
+    "covariantly",
     "cronspec",
     "dall",
     "Dall",
@@ -76,6 +80,7 @@
     "myapp",
     "navigations",
     "nextjs",
+    "noul",
     "nuxi",
     "nuxt",
     "Nuxt",
@@ -102,6 +107,7 @@
     "sandboxed",
     "sarahs",
     "Schedulable",
+    "SCIM",
     "SENDGRID",
     "serializability",
     "shadcn",
@@ -156,5 +162,6 @@
     "zoneinfo"
   ],
   "ignoreRegExpList": ["/#[\\w-]+/", "/\\w+.png/"],
+  "ignorePaths": ["ai-gateway/_models-list.mdx"],
   "enableFiletypes": ["mdx", "md"]
 }

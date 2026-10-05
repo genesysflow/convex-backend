@@ -4,11 +4,11 @@
 #![feature(try_blocks_heterogeneous)]
 mod chunks;
 mod connection;
+mod deployment_deletion;
 mod document_encoding;
 mod metrics;
 mod sql;
 mod v5;
-#[allow(dead_code)]
 mod v6;
 use std::{
     ops::Deref,
@@ -22,12 +22,30 @@ use common::{
     },
     runtime::Runtime,
     shutdown::ShutdownSignal,
-    types::PersistenceVersion,
+    types::{
+        DeploymentId,
+        PersistenceVersion,
+    },
 };
 pub use connection::ConvexMySqlPool;
+pub use v6::maintenance::{
+    IndexesLogMaintenance,
+    MaintenanceRound,
+};
+
+/// Maximum number of documents in one write: the sum of
+/// TRANSACTION_MAX_SYSTEM_NUM_WRITES and TRANSACTION_MAX_NUM_USER_WRITES.
+pub(crate) const MAX_INSERT_SIZE: usize = 56000;
 
 pub type MySqlPersistence<RT> = v5::Persistence<RT>;
 pub type MySqlReader<RT> = v5::Reader<RT>;
+pub use deployment_deletion::{
+    DeploymentDeleter,
+    DeploymentDeletionBatch,
+    DeploymentDeletionCursor,
+    DeploymentDeletionPool,
+    DeploymentDeletionTarget,
+};
 
 #[derive(Clone, Debug)]
 pub struct MySqlInstanceName {
@@ -68,6 +86,7 @@ pub struct MySqlOptions {
     pub version: PersistenceVersion,
     pub instance_name: MySqlInstanceName,
     pub multitenant: bool,
+    pub deployment_id: DeploymentId,
 }
 
 #[derive(Debug)]
@@ -76,6 +95,7 @@ pub struct MySqlReaderOptions {
     pub version: PersistenceVersion,
     pub instance_name: MySqlInstanceName,
     pub multitenant: bool,
+    pub deployment_id: DeploymentId,
 }
 
 pub async fn connect_persistence<RT: Runtime>(

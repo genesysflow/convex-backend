@@ -2,7 +2,7 @@ name: Build Patched Upstream Backend
 
 on:
   schedule:
-    # The official self-hosted image is built from get-convex's release branch.
+    # The official self-hosted image is built from convex's release branch.
     - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
@@ -52,7 +52,7 @@ jobs:
             ref="$UPSTREAM_REF"
             echo "Using manually selected upstream ref: $ref"
           else
-            image="ghcr.io/get-convex/convex-backend:latest"
+            image="ghcr.io/convex/convex-backend:latest"
             image_config="$(
               docker buildx imagetools inspect "$image" \
                 --format '{{json (index .Image "linux/amd64")}}'
@@ -70,7 +70,7 @@ jobs:
       - name: Check out upstream source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          repository: get-convex/convex-backend
+          repository: convex/convex-backend
           ref: ${{ steps.upstream.outputs.ref }}
           fetch-depth: 1
           path: source
@@ -173,5 +173,5 @@ jobs:
             echo
             echo "Published \`$IMAGE:$UPSTREAM_SHA\` and \`$IMAGE:latest\`."
             echo
-            echo "Upstream source: \`get-convex/convex-backend@$UPSTREAM_SHA\`"
+            echo "Upstream source: \`convex/convex-backend@$UPSTREAM_SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"

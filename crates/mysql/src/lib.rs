@@ -9,6 +9,9 @@ mod document_encoding;
 mod metrics;
 mod sql;
 mod v5;
+mod v5_shadow;
+pub use v5_shadow::maintenance as v5_shadow_maintenance;
+use v5_shadow::V5Shadow as _;
 mod v6;
 use std::{
     ops::Deref,
@@ -44,6 +47,7 @@ pub use deployment_deletion::{
     DeploymentDeletionBatch,
     DeploymentDeletionCursor,
     DeploymentDeletionPool,
+    DeploymentDeletionTable,
     DeploymentDeletionTarget,
 };
 
@@ -72,14 +76,6 @@ impl MySqlInstanceName {
     }
 }
 
-#[derive(thiserror::Error, Debug)]
-pub enum ConnectError {
-    #[error("persistence is read-only, data migration in progress")]
-    ReadOnly,
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-}
-
 #[derive(Clone, Debug)]
 pub struct MySqlOptions {
     pub allow_read_only: bool,
@@ -105,7 +101,19 @@ pub async fn connect_persistence<RT: Runtime>(
     lease_lost_shutdown: ShutdownSignal,
 ) -> anyhow::Result<Arc<dyn Persistence>> {
     match options.version {
-        PersistenceVersion::V5 => v5::connect(pool, db_name, options, lease_lost_shutdown).await,
+        PersistenceVersion::V5 => {
+            let shadow = v5_shadow::active_shadow::<RT>();
+            match v5_shadow::connection_mode(&shadow, pool.cluster_name(), options.multitenant) {
+                v5_shadow::ShadowMode::Off => {
+                    v5::connect(pool, db_name, options, lease_lost_shutdown).await
+                },
+                mode => {
+                    shadow
+                        .connect(mode, pool, db_name, options, lease_lost_shutdown)
+                        .await
+                },
+            }
+        },
         PersistenceVersion::V6 => v6::connect(pool, db_name, options, lease_lost_shutdown).await,
     }
 }

@@ -424,6 +424,11 @@ export interface paths {
          *     from each response back in the next request as `cursor`. Omit `cursor` on
          *     the first call.
          *
+         *     Apply each page's `truncates` before its `values`, and persist these changes
+         *     atomically with `pagination.nextCursor`. Retrying the same input cursor may
+         *     return a different page, so non-atomic updates can lead to data
+         *     inconsistency.
+         *
          *     To do a one time data sync, keep fetching pages until reaching an `upToDate`
          *     page. For a continuous streaming export, continue fetching pages
          *     periodically. It's recommended to sleep between `upToDate` pages to reduce
@@ -558,8 +563,8 @@ export interface components {
              */
             totalDocuments: number;
         };
-        /** @description The sync reached a consistent snapshot at `syncedTs`, but newer data is
-         *     already available; it is streaming later changes (CDC). */
+        /** @description The sync reached a consistent snapshot at `syncedTs`, but its timestamp is
+         *     stale; it is streaming later changes (CDC). Newer data may be available. */
         ActiveDataSyncStale: {
             /**
              * @description Always `stale`. (enum property replaced by openapi-typescript)
@@ -1111,7 +1116,7 @@ export interface components {
             /** @description AWS access key ID used to write to the bucket. The matching secret
              *     access key is write-only and is never returned. */
             accessKeyId: string;
-            /** @description The components, tables, and columns being mirrored. */
+            /** @description The components and tables being exported. */
             selection: components["schemas"]["Selection"];
             /** @description How often the mirror is refreshed. */
             period: components["schemas"]["SyncPeriod"];

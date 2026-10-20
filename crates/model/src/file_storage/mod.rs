@@ -387,9 +387,10 @@ impl<RT: Runtime> FileStorageSizeTracker<RT> {
     pub async fn total_size(
         &mut self,
         identity: &Identity,
-        snapshot: &DatabaseSnapshot<RT>,
+        snapshot: DatabaseSnapshot<RT>,
     ) -> anyhow::Result<u64> {
-        let target_tables = file_storage_target_tables(identity, snapshot).await?;
+        let target_tables = file_storage_target_tables(identity, &snapshot).await?;
+        drop(snapshot);
         // Only resume when every table counted in the totals is still a target:
         // a dropped table's documents are baked into them, and the iterator
         // will never emit them again for us to subtract back out. Added tables
@@ -468,9 +469,9 @@ async fn sync_totals<RT: Runtime>(
         }
         match page.status {
             DataSyncStatus::UpToDate { .. } => break page.cursor,
-            // `Stale` is a consistent snapshot too, but one a page limit cut
-            // short of the latest commit — keep paging so the totals don't
-            // fall further behind on every call.
+            // `Stale` is a consistent snapshot too, but behind the latest
+            // repeatable timestamp — keep paging so the totals don't fall
+            // further behind on every call.
             DataSyncStatus::Stale { .. } | DataSyncStatus::Snapshotting { .. } => {},
         }
         cursor = Some(page.cursor);

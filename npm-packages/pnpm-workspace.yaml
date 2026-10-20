@@ -1,5 +1,7 @@
 packages:
   - "@convex-dev/ai-sdk-provider"
+  - "@convex-dev/bundle-analyzer"
+  - "@convex-dev/bundle-analyzer/tests/fixture"
   - "@convex-dev/codemod"
   - "@convex-dev/codemod/test/explicit-ids/custom-convex-folder"
   - "@convex-dev/codemod/test/explicit-ids/sample-convex-project"
@@ -157,6 +159,8 @@ publishBranch: release
 minimumReleaseAge: 10080
 
 minimumReleaseAgeExclude:
+  # First-party package, thus the delay protects nothing here.
+  - convex-helpers
   # AI SDK's experimental evaluation interface for Jev.
   - ai@7.0.105
   - "@ai-sdk/gateway@4.0.85"
@@ -197,6 +201,7 @@ minimumReleaseAgeExclude:
   - adm-zip@0.6.1
   # First-party publish; the convex-test docs often reference new features
   - convex-test
+  - "@convex-dev/workpool@0.4.14"
   # First-party publish; the CLI can't use workspace:* because copy.bara.sky
   # mirrors it to convex-js.
   - "@convex-dev/platform"
@@ -221,6 +226,19 @@ hoistPattern:
 # Declaring @types/react as an optional peer links the consumer's own types
 # version next to each package instance instead.
 packageExtensions:
+  # These /test entrypoints need the consuming app's convex-test types.
+  "@convex-dev/workpool@0.4.14":
+    peerDependencies:
+      convex-test: "^0.0.61"
+    peerDependenciesMeta:
+      convex-test:
+        optional: true
+  "@convex-dev/batch-worker@0.2.2":
+    peerDependencies:
+      convex-test: "*"
+    peerDependenciesMeta:
+      convex-test:
+        optional: true
   "@headlessui/react":
     peerDependencies:
       "@types/react": "*"
@@ -433,7 +451,7 @@ overrides:
 # Workspace scripts run after an explicit install. Avoid pnpm 11 racing installs
 # from concurrent Turbo tasks when it detects transient node_modules changes.
 verifyDepsBeforeRun: false
-# We use git dependencies, in particular get-convex/saffron
+# We use git dependencies, in particular convex/saffron
 blockExoticSubdeps: false
 # pnpm 10 denied dependency lifecycle scripts by default. Keep that policy
 # explicit under pnpm 11, which otherwise fails and scaffolds undecided entries.

@@ -51,6 +51,9 @@ use common::{
         UDF_EXECUTOR_OCC_INITIAL_BACKOFF,
         UDF_EXECUTOR_OCC_MAX_BACKOFF,
         UDF_EXECUTOR_OCC_MAX_RETRIES,
+        UDF_FILE_STORAGE_INITIAL_BACKOFF,
+        UDF_FILE_STORAGE_MAX_BACKOFF,
+        UDF_FILE_STORAGE_MAX_RETRIES,
     },
     log_lines::{
         run_function_and_collect_log_lines,
@@ -91,7 +94,11 @@ use errors::{
     ErrorMetadata,
     ErrorMetadataAnyhowExt,
 };
-use file_storage::TransactionalFileStorage;
+use file_storage::{
+    TransactionalFileStorage,
+    FILE_DOWNLOAD_FAILED_SHORT_MSG,
+    FILE_UPLOAD_FAILED_SHORT_MSG,
+};
 use function_runner::{
     server::{
         FunctionMetadata,
@@ -397,8 +404,6 @@ impl<RT: Runtime> FunctionRouter<RT> {
 
     // Drain the v8 action concurrency permits to deterministically
     // exercise the concurrency limit in tests.
-    // Execute using the function runner. Can be used for v8 udfs other than http
-    // actions.
     #[fastrace::trace]
     async fn function_runner_execute(
         &self,
@@ -410,6 +415,11 @@ impl<RT: Runtime> FunctionRouter<RT> {
         http_action_metadata: Option<HttpActionMetadata>,
         wait_for_permit: bool,
     ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
+        // Read in this transaction so preference changes invalidate cached queries.
+        let udf_runtime = BackendInfoModel::new(&mut tx)
+            .get()
+            .await?
+            .and_then(|info| info.default_udf_runtime);
         let in_memory_index_last_modified = self
             .database
             .snapshot(tx.begin_timestamp())?
@@ -433,6 +443,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
             .function_runner
             .run_function(
                 udf_type,
+                udf_runtime,
                 tx.identity().clone(),
                 tx.begin_timestamp(),
                 FunctionWrites {
@@ -469,6 +480,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 system_tx_size,
                 updates,
                 function_tx.rows_read_by_tablet,
+                function_tx.uploaded_files,
             )?;
             Some(tx)
         } else {
@@ -938,9 +950,14 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             *UDF_EXECUTOR_OCC_INITIAL_BACKOFF,
             *UDF_EXECUTOR_OCC_MAX_BACKOFF,
         );
+        let mut file_storage_backoff = Backoff::new(
+            *UDF_FILE_STORAGE_INITIAL_BACKOFF,
+            *UDF_FILE_STORAGE_MAX_BACKOFF,
+        );
 
         loop {
-            let mutation_retry_count = backoff.failures() as usize;
+            let occ_retry_count = backoff.failures() as usize;
+            let mutation_retry_count = occ_retry_count + file_storage_backoff.failures() as usize;
             let usage_tracker = FunctionUsageTracker::new();
 
             // Note that we use different context for every mutation attempt.
@@ -983,6 +1000,20 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         let sleep = backoff.fail(&mut self.runtime.rng());
                         tracing::warn!(
                             "Write throughput limit exceeded, retrying {write_source:?} after \
+                             {sleep:?}",
+                        );
+                        self.runtime.wait(sleep).await;
+                        continue;
+                    }
+                    if matches!(
+                        e.short_msg(),
+                        FILE_UPLOAD_FAILED_SHORT_MSG | FILE_DOWNLOAD_FAILED_SHORT_MSG
+                    ) && (file_storage_backoff.failures() as usize)
+                        < *UDF_FILE_STORAGE_MAX_RETRIES
+                    {
+                        let sleep = file_storage_backoff.fail(&mut self.runtime.rng());
+                        tracing::warn!(
+                            "File storage failed ({e:#}), retrying {write_source:?} after \
                              {sleep:?}",
                         );
                         self.runtime.wait(sleep).await;
@@ -1088,6 +1119,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                                     occ_info,
                                     mutation_queue_length,
                                     mutation_retry_count,
+                                    occ_retry_count,
                                     true,
                                 )
                                 .await;
@@ -1107,6 +1139,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                                     occ_info,
                                     mutation_queue_length,
                                     mutation_retry_count,
+                                    occ_retry_count,
                                     false,
                                 )
                                 .await;

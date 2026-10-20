@@ -29,7 +29,7 @@ In the first mutation that generates the upload URL you can control who can
 upload files to your Convex storage.
 
 **Example**:
-[File Storage with Queries and Mutations](https://github.com/get-convex/convex-demos/tree/main/file-storage)
+[File Storage with Queries and Mutations](https://github.com/convex/convex-demos/tree/main/file-storage)
 
 ### Calling the upload APIs from a web page
 
@@ -93,13 +93,10 @@ The file upload process can be more tightly controlled by leveraging
 using a single request, but requiring correct CORS headers configuration.
 
 The custom upload HTTP action can control who can upload files to your Convex
-storage. But note that the HTTP action request size is
-[currently limited](/functions/http-actions.mdx#limits) to 20MB. For larger
-files you need to use upload URLs as described
-[above](#uploading-files-via-upload-urls).
+storage.
 
 **Example:**
-[File Storage with HTTP Actions](https://github.com/get-convex/convex-demos/tree/main/file-storage-with-http)
+[File Storage with HTTP Actions](https://github.com/convex/convex-demos/tree/main/file-storage-with-http)
 
 ### Calling the upload HTTP action from a web page
 

@@ -832,7 +832,7 @@
           "pro"
         ],
         "summary": "Data sync",
-        "description": "Paginated streamable export of some or all of a deployment's data.\n\nCall this endpoint repeatedly, passing the opaque `pagination.nextCursor`\nfrom each response back in the next request as `cursor`. Omit `cursor` on\nthe first call.\n\nTo do a one time data sync, keep fetching pages until reaching an `upToDate`\npage. For a continuous streaming export, continue fetching pages\nperiodically. It's recommended to sleep between `upToDate` pages to reduce\noverhead.\n\nThe caller must have the `deployment:data:view` permission.",
+        "description": "Paginated streamable export of some or all of a deployment's data.\n\nCall this endpoint repeatedly, passing the opaque `pagination.nextCursor`\nfrom each response back in the next request as `cursor`. Omit `cursor` on\nthe first call.\n\nApply each page's `truncates` before its `values`, and persist these changes\natomically with `pagination.nextCursor`. Retrying the same input cursor may\nreturn a different page, so non-atomic updates can lead to data\ninconsistency.\n\nTo do a one time data sync, keep fetching pages until reaching an `upToDate`\npage. For a continuous streaming export, continue fetching pages\nperiodically. It's recommended to sleep between `upToDate` pages to reduce\noverhead.\n\nThe caller must have the `deployment:data:view` permission.",
         "operationId": "data_sync",
         "requestBody": {
           "content": {
@@ -1091,7 +1091,7 @@
       },
       "ActiveDataSyncStale": {
         "type": "object",
-        "description": "The sync reached a consistent snapshot at `syncedTs`, but newer data is\nalready available; it is streaming later changes (CDC).",
+        "description": "The sync reached a consistent snapshot at `syncedTs`, but its timestamp is\nstale; it is streaming later changes (CDC). Newer data may be available.",
         "required": [
           "type",
           "totalTables",
@@ -1853,7 +1853,7 @@
               },
               {
                 "$ref": "#/components/schemas/Selection",
-                "description": "The components, tables, and columns to mirror. Defaults to everything."
+                "description": "The components and tables to export. Defaults to everything. Each table\nexports whole documents, so filtering fields within a table is rejected."
               }
             ]
           },
@@ -2924,7 +2924,7 @@
           },
           "selection": {
             "$ref": "#/components/schemas/Selection",
-            "description": "The components, tables, and columns being mirrored."
+            "description": "The components and tables being exported."
           },
           "period": {
             "$ref": "#/components/schemas/SyncPeriod",
@@ -3451,7 +3451,7 @@
               },
               {
                 "$ref": "#/components/schemas/Selection",
-                "description": "The components, tables, and columns to mirror."
+                "description": "The components and tables to export. Each table exports whole\ndocuments, so filtering fields within a table is rejected."
               }
             ]
           },

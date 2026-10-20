@@ -1,13 +1,74 @@
 # Changelog
 
-## 1.47.0 (unreleased)
+## 1.48.0 (unreleased)
 
+- `npx convex dev --verbose` and `npx convex deploy --verbose` no longer print
+  environment variable values. The logged list of environment variables shows
+  every value as `<redacted>`, and values of 8 or more characters are also
+  redacted wherever else they appear in the logged push response and diff, such
+  as auth providers that `auth.config.ts` builds from `process.env`.
+
+- Fixed `npx convex ai-files install` and `npx convex ai-files update` reporting
+  success and exiting 0 when the guidelines download or the agent skills
+  install failed. They now exit with code 1.
+
+
+## 1.47.0
+
+- Fixed the next step printed by `npx convex project create`. It suggested
+  `npx convex deployment create <team>:<project>:dev --type dev`, which always
+  failed because `dev` is reserved for your default dev deployment. It now
+  suggests a `dev/my-feature` reference and passes `--select`.
 - `npx convex deploy` now asks for confirmation before creating or changing an
   index on a large table, since the deploy blocks until the index is backfilled.
   Stage the index (`staged: true`) to backfill it in the background instead, or
   pass the new `--skip-large-indexes-check` flag to proceed without
   confirmation. That flag also covers deleting large indexes, replacing the
   hidden `--allow-deleting-large-indexes` flag, which keeps working.
+- The `envList` MCP tool now returns only environment variable names by default,
+  so secrets stay out of the agent's context. Pass `includeValues: true` to get
+  the values too, or use `envGet` to read a single variable.
+- `npx convex env list` and `npx convex env default list` have a new
+  `--include-values` flag for printing values explicitly. Values are still
+  printed by default. The docs and help text now use `--include-values` wherever
+  the values are needed, like
+  `npx convex env list --include-values > .env.convex`, and `--names-only` for
+  just listing variables.
+- Added `.staged()` to `defineTable` for validating a schema change in the
+  background instead of blocking the deploy on a scan of the table. Pass the
+  fields to add or change, set a field to `undefined` to remove it, or pass a
+  full validator. The current validator stays enforced while Convex checks
+  existing documents and new writes against the staged one. `npx convex deploy`
+  and `npx convex deploy --dry-run` report each staged table as validating,
+  validated, or failed, and the dry-run warning about scanning large tables now
+  suggests staging the validator. Once a staged validator is validated, moving
+  it into `defineTable` deploys without scanning the table. A deploy that would
+  discard pending or completed staged validation asks for confirmation; pass
+  `--allow-unstaging-schema` to skip the prompt in CI. See
+  https://docs.convex.dev/database/schemas#staged-validators.
+- `ctx.meta.getSnapshotTs()` is now public API. It returns the database
+  timestamp of the snapshot the current function reads from, in nanoseconds, on
+  the same clock as `db.vars.commitTs`. See
+  https://docs.convex.dev/database/advanced/commit-timestamp.
+- `convex/server` exports `getServiceUrl`, which returns the base URL of a
+  Convex-managed service such as the AI gateway, to pair with `getServiceToken`,
+  along with a `ServiceName` type. The client no longer rejects service names it
+  doesn't know about, so libraries can adopt new services without requiring a
+  newer `convex` version.
+- Fixed the Convex MCP server stalling permanently after overlapping tool calls.
+- Fixed the error reported when a function or symbol is passed where a Convex
+  value is expected. It now names the unsupported type and its path, like
+  `Function "[Function]" is not a supported Convex type` at `.cb`, instead of
+  throwing `Cannot read properties of undefined (reading 'length')`.
+- When a push fails because an environment variable used by `auth.config.ts` is
+  not set on the deployment, the CLI now prints the `npx convex env set`
+  commands to run and a link to the deployment's environment variable settings.
+- Region prompts in the CLI list regions in the same order as the dashboard, and
+  `npx convex deployment create --region` accepts the Canada
+  (`aws-ca-central-1`) and Asia Pacific (`aws-ap-southeast-2`) regions. See
+  https://docs.convex.dev/production/regions.
+- `npx convex deployment usage-limits set --metric aiGatewayCostDollars` sets
+  the AI gateway spending limit.
 
 ## 1.46.0
 
@@ -493,7 +554,7 @@
 ## 1.31.4
 
 - Fix
-  [`window.addEventListener is not a function`](https://github.com/get-convex/convex-backend/issues/304)
+  [`window.addEventListener is not a function`](https://github.com/convex/convex-backend/issues/304)
   bug in React Native.
 
 ## 1.31.3
@@ -941,10 +1002,10 @@ To upgrade to this release you'll need to upgrade any Convex components you use.
 - `npx convex dev` tails logs by default. See the `--tail-logs` option for more.
 
 - Improvement to the `.unique()` error message to print `_id`s
-  [PR](https://github.com/get-convex/convex-backend/pull/59)
+  [PR](https://github.com/convex/convex-backend/pull/59)
 
 - Fixes to avoid race conditions in auth
-  [PR](https://github.com/get-convex/convex-js/pull/29)
+  [PR](https://github.com/convex/convex-js/pull/29)
 
 ## 1.20.0
 
@@ -977,7 +1038,7 @@ To upgrade to this release you'll need to upgrade any Convex components you use.
   The environment variables `CONVEX_SELF_HOSTED_URL` and
   `CONVEX_SELF_HOSTED_ADMIN_KEY` are now used to identity self-hosted
   deployments.
-  <https://github.com/get-convex/convex-backend/tree/main/self-hosted#self-hosting-convex>
+  <https://github.com/convex/convex-backend/tree/main/self-hosted#self-hosting-convex>
   for more.
 
 - export the `ValidatorJSON` record types.

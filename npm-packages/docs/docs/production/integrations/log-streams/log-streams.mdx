@@ -386,7 +386,7 @@ Schema:
   to deduplicate events when processing retries.
 - `provider`: string naming the provider that reported the usage
 - `endpoint`: string, one of
-  `["chat_completions", "decisions", "embeddings", "images", "messages", "responses", "videos"]`
+  `["chat_completions", "decisions", "embeddings", "images", "messages", "responses", "speech", "transcriptions", "videos"]`
 - `upstream_id`: optional provider request identifier
 - `model`: optional provider model identifier
 - `prompt_tokens`, `completion_tokens`, `total_tokens`: optional token counts
@@ -411,7 +411,7 @@ Example event:
     "path": "chat.js:reply",
     "type": "action"
   },
-  "inference_id": "inf_01J7EXAMPLE",
+  "inference_id": "0f8c3a52-6d1e-4b7a-9c2f-4e5d6a7b8c9d",
   "provider": "openRouter",
   "endpoint": "messages",
   "upstream_id": "gen-abc123",

@@ -2,6 +2,7 @@
 //! read-only and persistence-globals tables.
 
 use std::{
+    borrow::Cow,
     fmt::Write,
     iter,
     ops::Bound,
@@ -35,6 +36,7 @@ use mysql_async::{
 
 use super::{
     column,
+    reader::DocumentScope,
     PersistenceDeploymentId,
 };
 use crate::chunks::ApproxSize;
@@ -543,6 +545,12 @@ fn union_arms(
 /// past the prefix limit is not key order; the cursor follows that order, so
 /// pagination is consistent, and the index scan sorts each equal-prefix run by
 /// the reconstructed key.
+///
+/// Each result row ends with the `indexes_maintenance_state` columns of
+/// [`READ_LOG_BUCKET_BOUNDS`], read in the same statement as the page. The
+/// LEFT JOIN yields one row of NULL index columns when the page is empty, so
+/// the bounds are reported either way. The union is limited to one page before
+/// joining documents to bound document lookups by `batch_size`.
 pub(crate) fn index_query(
     deployment_id: PersistenceDeploymentId,
     index_id: PersistenceIndexId,
@@ -552,6 +560,7 @@ pub(crate) fn index_query(
     order: Order,
     batch_size: usize,
     log_buckets: &[LogBucket],
+    documents: &DocumentScope,
 ) -> (String, Vec<Value>) {
     let order = match order {
         Order::Asc => "ASC",
@@ -562,7 +571,7 @@ pub(crate) fn index_query(
     append_bound_clause(&mut where_clause, &mut bounds, &lower, BoundSide::Lower);
     append_bound_clause(&mut where_clause, &mut bounds, &upper, BoundSide::Upper);
 
-    let (arms, params) = union_arms(
+    let (arms, mut params) = union_arms(
         log_buckets,
         |table, successor_filter| {
             format!(
@@ -583,14 +592,27 @@ LIMIT {batch_size})"#
             )
         },
     );
+    let document_join = match documents {
+        DocumentScope::DeploymentId => Cow::Borrowed(DOCUMENT_JOIN),
+        DocumentScope::InstanceName(instance) => {
+            params.push(instance.clone().into());
+            Cow::Owned(
+                DOCUMENT_JOIN.replace("D.deployment_id = U.deployment_id", "D.instance_name = ?"),
+            )
+        },
+    };
     (
         format!(
             r#"
-SELECT U.index_id, U.key_prefix, U.key_suffix_hash, U.key_suffix, U.ts, U.table_id, U.document_id, D.json_value, D.prev_ts
-FROM (
+SELECT U.index_id, U.key_prefix, U.key_suffix_hash, U.key_suffix, U.ts, U.table_id, U.document_id, D.json_value, D.prev_ts, S.created_through_ts, S.oldest_kept_ts
+FROM @db_name.indexes_maintenance_state S
+LEFT JOIN (
 {arms}
-) U
-{DOCUMENT_JOIN}
+ORDER BY key_prefix {order}, key_suffix_hash {order}
+LIMIT {batch_size}
+) U ON TRUE
+{document_join}
+WHERE S.id = 1
 ORDER BY U.key_prefix {order}, U.key_suffix_hash {order}
 LIMIT {batch_size}
 "#
@@ -789,8 +811,13 @@ AND TABLE_NAME IN ('documents', 'leases', 'read_only', 'persistence_globals', 'i
 AND COLUMN_NAME = 'deployment_id'
 "#;
 
+pub(crate) const LEASE_ACQUIRE_ALLOW_READ_ONLY: &str = r#"
+UPDATE @db_name.leases SET ts = ? WHERE ? > ts AND deployment_id = ?
+"#;
+
 pub(crate) const LEASE_ACQUIRE: &str = r#"
 UPDATE @db_name.leases SET ts = ? WHERE ? > ts AND deployment_id = ?
+AND NOT EXISTS (SELECT 1 FROM @db_name.read_only WHERE deployment_id = ?)
 "#;
 
 pub(crate) const LEASE_PRECONDITION: &str = r#"
@@ -802,8 +829,6 @@ SELECT json_value FROM @db_name.persistence_globals
 WHERE deployment_id = ? AND `key` = ?
 "#;
 
-pub(crate) const CHECK_READ_ONLY: &str =
-    "SELECT deployment_id FROM @db_name.read_only WHERE deployment_id = ?";
 pub(crate) const SET_READ_ONLY: &str =
     "INSERT IGNORE INTO @db_name.read_only (deployment_id) VALUES (?)";
 pub(crate) const UNSET_READ_ONLY: &str = "DELETE FROM @db_name.read_only WHERE deployment_id = ?";

@@ -21,6 +21,7 @@ use std::{
         NonZeroU32,
         NonZeroUsize,
     },
+    path::PathBuf,
     sync::LazyLock,
     time::Duration,
 };
@@ -278,6 +279,9 @@ pub static DATA_SYNC_PAGE_BYTES_LIMIT: LazyLock<usize> =
 /// Max number of rows `DataSyncIterator` will read from persistence when
 /// computing a single page. A page can read many more rows than it emits when
 /// catching up the document log with a narrow table filter (lots of skipping).
+///
+/// Note that `DataSyncIterator` never splits up transactions, so large
+/// transactions will still exceed this value.
 ///
 /// Must be `>= DATA_SYNC_PAGE_SIZE_LIMIT`: the `by_id` dimension reads up to
 /// `page_size_limit` rows per page, so the row-read bound can't be smaller than
@@ -1230,6 +1234,26 @@ pub static MYSQL_MAX_QUERY_BATCH_SIZE: LazyLock<usize> =
 pub static MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE: LazyLock<usize> =
     LazyLock::new(|| env_config("MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE", 8));
 
+/// Target number of rows deleted per second from each logical table during
+/// deployment cleanup. Lower values reduce database load at the cost of slower
+/// cleanup; the value must be nonzero.
+pub static DEPLOYMENT_DELETION_TARGET_ROWS_PER_SECOND: LazyLock<NonZeroU32> = LazyLock::new(|| {
+    env_config(
+        "DEPLOYMENT_DELETION_TARGET_ROWS_PER_SECOND",
+        NonZeroU32::new(5000).unwrap(),
+    )
+});
+
+/// Maximum number of rows deleted in one MySQL deployment cleanup query. Lower
+/// values reduce the size and lock duration of each transaction at the cost of
+/// more queries; the value must be nonzero.
+pub static DEPLOYMENT_DELETION_BATCH_SIZE: LazyLock<NonZeroU32> = LazyLock::new(|| {
+    env_config(
+        "DEPLOYMENT_DELETION_BATCH_SIZE",
+        NonZeroU32::new(2500).unwrap(),
+    )
+});
+
 /// Close a connection after it has been idle for some time. RDS proxy closes
 /// connections after idle_client_timeout in mysql.tf, which should be
 /// configured to be higher than this.
@@ -1483,10 +1507,8 @@ pub static FUNRUN_MAX_CPU_PRESSURE: LazyLock<f64> =
 /// larger than (N / 15) where N is the number of instances with lambdas.
 ///
 /// You can check go/num-instances-with-lambdas
-///
-/// NOTE: the true value of this is overridden in big brain knob overrides
 pub static AWS_LAMBDA_DEPLOY_SPLAY: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("AWS_LAMBDA_DEPLOY_SPLAY_SECONDS", 32400)));
+    LazyLock::new(|| Duration::from_secs(env_config("AWS_LAMBDA_DEPLOY_SPLAY_SECONDS", 64800)));
 
 /// How long of a window to debounce static lambda deployments. Don't allow too
 /// many static deploys in a small window to protect the infrastructure.
@@ -1560,6 +1582,31 @@ pub static BACKEND_USAGE_FIREHOSE_NAME: LazyLock<Option<String>> = LazyLock::new
     }
 });
 
+/// Local usage Firehose output as JSONL; ignored in production.
+pub static USAGE_FIREHOSE_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    if *IS_PROD {
+        return None;
+    }
+    let result: String = env_config("USAGE_FIREHOSE_FILE", String::new());
+    (!result.is_empty()).then(|| PathBuf::from(result))
+});
+
+/// Local audit Firehose output with egress accounting; ignored in production.
+pub static AUDIT_LOG_FIREHOSE_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    if *IS_PROD {
+        return None;
+    }
+    let result: String = env_config("AUDIT_LOG_FIREHOSE_FILE", String::new());
+    (!result.is_empty()).then(|| PathBuf::from(result))
+});
+
+/// Maximum buffered usage-aggregation keys across the process, shared by
+/// every aggregated event kind. Key strings are bounded function and component
+/// paths, so this bounds aggregation memory. At capacity, existing keys
+/// accumulate and new keys lose their usage.
+pub static USAGE_AGGREGATION_MAX_KEYS: LazyLock<usize> =
+    LazyLock::new(|| env_config("USAGE_AGGREGATION_MAX_KEYS", 100_000));
+
 /// Firehose stream for AI gateway usage rows, landing at
 /// `s3://cvx-data-lake-prod/ai_usage/`. Its own stream, not the backend usage
 /// one, so AI ingest lag can't stall usage metering. Empty turns emit off.
@@ -1590,6 +1637,29 @@ pub static USAGE_TRACKING_WORKER_SLOW_TRACE_THRESHOLD: LazyLock<Duration> = Lazy
 /// `_file_storage`'s, so below this many documents a fresh sync is cheaper.
 pub static FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME: LazyLock<i64> =
     LazyLock::new(|| env_config("FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME", 4096));
+
+/// The maximum amount of time a mutation can take to upload stored files.
+pub static UDF_FILE_STORAGE_UPLOAD_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("UDF_FILE_STORAGE_UPLOAD_TIMEOUT_SECONDS", 5)));
+
+/// Maximum amount of time a mutation can spend downloading files before
+/// failing.
+pub static UDF_FILE_STORAGE_DOWNLOAD_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config("UDF_FILE_STORAGE_DOWNLOAD_TIMEOUT_SECONDS", 5))
+});
+
+/// How many times to rerun a mutation with file storage failures before
+/// returning the error to its caller.
+pub static UDF_FILE_STORAGE_MAX_RETRIES: LazyLock<usize> =
+    LazyLock::new(|| env_config("UDF_FILE_STORAGE_MAX_RETRIES", 2));
+
+/// Initial backoff before rerunning a mutation with file storage failures.
+pub static UDF_FILE_STORAGE_INITIAL_BACKOFF: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_millis(env_config("UDF_FILE_STORAGE_INITIAL_BACKOFF_MS", 500)));
+
+/// Maximum backoff before rerunning a mutation with file storage failures.
+pub static UDF_FILE_STORAGE_MAX_BACKOFF: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_millis(env_config("UDF_FILE_STORAGE_MAX_BACKOFF_MS", 2000)));
 
 /// The number of events we can accumulate in the buffer that's used to send
 /// events from our business logic to our firehose client.
@@ -1765,13 +1835,6 @@ pub static MAX_ECHO_BYTES: LazyLock<usize> =
 /// The limit on the number of user modules in a push bundle.
 pub static MAX_USER_MODULES: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_USER_MODULES", 4096));
-
-/// The limit, in bytes, on the zipped size of a deployment's source packages
-/// (user modules plus external node dependencies).
-///
-/// Conductor will build a zip of this size in memory during code push.
-pub static MAX_ZIPPED_PACKAGES_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_ZIPPED_PACKAGES_SIZE", 90_000_000));
 
 /// Percentage of request traces that should sampled.
 ///
@@ -2114,3 +2177,26 @@ pub static HTTP2_CLIENT_KEEPALIVE_INTERVAL: LazyLock<Duration> = LazyLock::new(|
 /// dropped.
 pub static HTTP2_CLIENT_KEEPALIVE_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("HTTP2_CLIENT_KEEPALIVE_TIMEOUT_SECONDS", 15)));
+
+/// Longest lifetime `ctx.auth.signJwt` may give a token.
+pub static DEPLOYMENT_JWT_MAX_LIFETIME: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config("DEPLOYMENT_JWT_MAX_LIFETIME_SECONDS", 60 * 60))
+});
+
+/// How long verifiers may cache the deployment JWKS served at
+/// `/.well-known/jwks.json`.
+pub static DEPLOYMENT_JWKS_MAX_AGE: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("DEPLOYMENT_JWKS_MAX_AGE_SECONDS", 300)));
+
+/// Max number of log lines in a single V8 action
+pub static MAX_LOG_LINES_V8_ACTIONS: LazyLock<usize> =
+    LazyLock::new(|| env_config("MAX_LOG_LINES_V8_ACTIONS", 1024).max(1));
+
+/// Max number of log lines in a single Node action. Sent to the Node executor
+/// with each request.
+pub static MAX_LOG_LINES_NODE_ACTIONS: LazyLock<usize> =
+    LazyLock::new(|| env_config("MAX_LOG_LINES_NODE_ACTIONS", 1024).max(1));
+
+/// Max number of log lines in a single query or mutation
+pub static MAX_LOG_LINES_DATABASE_UDFS: LazyLock<usize> =
+    LazyLock::new(|| env_config("MAX_LOG_LINES_DATABASE_UDFS", 256).max(1));

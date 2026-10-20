@@ -21,7 +21,6 @@ use common::{
     types::{
         IndexName,
         ModuleEnvironment,
-        StorageUuid,
         UdfIdentifier,
     },
     RequestId,
@@ -352,7 +351,6 @@ impl UsageCounter {
         // maps but describe the same access.
         #[derive(Default)]
         struct DatabaseBandwidthCounters {
-            ingress: u64,
             ingress_v2: u64,
             egress: u64,
             egress_rows: u64,
@@ -364,9 +362,6 @@ impl UsageCounter {
             (ComponentPath, TableNameString),
             DatabaseBandwidthCounters,
         > = BTreeMap::new();
-        for (key, ingress) in stats.database_ingress {
-            database_bandwidth.entry(key).or_default().ingress += ingress;
-        }
         for (key, ingress) in stats.database_ingress_v2 {
             database_bandwidth.entry(key).or_default().ingress_v2 += ingress;
         }
@@ -397,7 +392,6 @@ impl UsageCounter {
             let component_bandwidth = bandwidth_by_component
                 .entry(component_path.clone())
                 .or_default();
-            component_bandwidth.ingress += bandwidth.ingress;
             component_bandwidth.ingress_v2 += bandwidth.ingress_v2;
             component_bandwidth.egress += bandwidth.egress;
             component_bandwidth.egress_rows += bandwidth.egress_rows;
@@ -408,13 +402,11 @@ impl UsageCounter {
         for (component_path, bandwidth) in bandwidth_by_component {
             usage_metrics.push(UsageEvent::DatabaseBandwidth {
                 id: execution_id.to_string(),
-                request_id: request_id.to_string(),
+                request_id: Some(request_id.to_string()),
                 component_path: component_path.serialize(),
                 udf_id: udf_id.clone(),
                 table_name: (),
-                ingress: bandwidth.ingress,
                 ingress_v2: bandwidth.ingress_v2,
-                egress: bandwidth.egress,
                 egress_rows: bandwidth.egress_rows,
                 egress_v2: bandwidth.egress_v2,
                 virtual_table_ingress: bandwidth.virtual_table_ingress,
@@ -581,9 +573,7 @@ pub trait StorageUsageTracker: Send + Sync {
         &self,
         component_path: ComponentPath,
         storage_api: &'static str,
-        storage_id: StorageUuid,
         content_type: Option<ContentType>,
-        sha256: Sha256Digest,
     ) -> Box<dyn StorageCallTracker>;
 }
 
@@ -647,9 +637,7 @@ impl StorageUsageTracker for UsageCounter {
         &self,
         component_path: ComponentPath,
         storage_api: &'static str,
-        storage_id: StorageUuid,
         content_type: Option<ContentType>,
-        sha256: Sha256Digest,
     ) -> Box<dyn StorageCallTracker> {
         let execution_id = ExecutionId::new();
         metrics::storage::log_storage_call();
@@ -657,12 +645,8 @@ impl StorageUsageTracker for UsageCounter {
             .record_async(vec![UsageEvent::StorageCall {
                 id: execution_id.to_string(),
                 component_path: component_path.serialize(),
-                // Ideally we would track the Id<_storage> instead of the StorageUuid
-                // but it's a bit annoying for now, so just going with this.
-                storage_id: storage_id.to_string(),
                 call: storage_api.to_string(),
                 content_type: content_type.map(|c| c.to_string()),
-                sha256: sha256.as_hex(),
             }])
             .await;
 
@@ -1020,9 +1004,7 @@ impl StorageUsageTracker for FunctionUsageTracker {
         &self,
         component_path: ComponentPath,
         storage_api: &'static str,
-        _storage_id: StorageUuid,
         _content_type: Option<ContentType>,
-        _sha256: Sha256Digest,
     ) -> Box<dyn StorageCallTracker> {
         let mut state = self.state.lock();
         metrics::storage::log_storage_call();

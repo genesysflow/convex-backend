@@ -11,6 +11,7 @@ import {
 } from "ai";
 import { getServiceToken } from "convex/server";
 import { createEvaluationModel } from "./evaluation-model.js";
+import { createTranscriptionModel } from "./transcription-model.js";
 import { createVideoModel } from "./video-model.js";
 
 type Provider = ReturnType<typeof createOpenAICompatible>;
@@ -22,6 +23,11 @@ type ProviderMetadata = NonNullable<
 type ImageModel = ReturnType<Provider["imageModel"]>;
 type LanguageModel = Parameters<typeof wrapLanguageModel>[0]["model"];
 type GatewayLanguageModel = ReturnType<typeof wrapLanguageModel>;
+
+export interface GatewayModelOptions {
+  /** Require an inference endpoint with a zero-data-retention policy. */
+  zdr?: boolean;
+}
 
 const maxEmbeddingsPerCall = 512;
 // Official providers require a credential before gatewayFetch replaces it with a deployment JWT.
@@ -109,9 +115,13 @@ function gatewayModelFetch(
   gatewayModelId: string,
   input: RequestInfo | URL,
   init?: RequestInit,
+  options?: GatewayModelOptions,
 ): Promise<Response> {
   const body = JSON.parse(init?.body as string);
   body.model = gatewayModelId;
+  if (options?.zdr !== undefined) {
+    body.provider = { ...body.provider, zdr: options.zdr };
+  }
   return gatewayFetch(input, { ...init, body: JSON.stringify(body) });
 }
 
@@ -135,16 +145,24 @@ function gatewayLanguageModel(
  * `getServiceToken` caches and refreshes credentials within the current action,
  * so calling this more than once in the same action is fine.
  */
-export function convexGateway(modelId: string): ChatModel {
-  return createGatewayProvider()(modelId);
+export function convexGateway(
+  modelId: string,
+  options?: GatewayModelOptions,
+): ChatModel {
+  return createGatewayProvider((input, init) =>
+    gatewayModelFetch(modelId, input, init, options),
+  )(modelId);
 }
 
-convexGateway.messages = function (modelId: string): GatewayLanguageModel {
+convexGateway.messages = function (
+  modelId: string,
+  options?: GatewayModelOptions,
+): GatewayLanguageModel {
   const provider = createAnthropic({
     name: "convexGateway.messages",
     baseURL: gatewayBaseURL(),
     authToken: placeholderCredential,
-    fetch: (input, init) => gatewayModelFetch(modelId, input, init),
+    fetch: (input, init) => gatewayModelFetch(modelId, input, init, options),
   });
   return gatewayLanguageModel(
     modelId,
@@ -152,12 +170,15 @@ convexGateway.messages = function (modelId: string): GatewayLanguageModel {
   );
 };
 
-convexGateway.responses = function (modelId: string): GatewayLanguageModel {
+convexGateway.responses = function (
+  modelId: string,
+  options?: GatewayModelOptions,
+): GatewayLanguageModel {
   const provider = createOpenAI({
     name: "convexGateway.responses",
     baseURL: gatewayBaseURL(),
     apiKey: placeholderCredential,
-    fetch: (input, init) => gatewayModelFetch(modelId, input, init),
+    fetch: (input, init) => gatewayModelFetch(modelId, input, init, options),
   });
   return gatewayLanguageModel(
     modelId,
@@ -169,18 +190,26 @@ convexGateway.responses = function (modelId: string): GatewayLanguageModel {
 };
 
 /** Evaluate typed questions through the alpha Decisions API. */
-convexGateway.evaluationModel = function (modelId: string) {
+convexGateway.evaluationModel = function (
+  modelId: string,
+  options?: GatewayModelOptions,
+) {
   return createEvaluationModel(
     modelId,
     gatewayBaseURL("alpha"),
-    gatewayFetch,
+    (input, init) => gatewayModelFetch(modelId, input, init, options),
     convexGatewayUsageMetadata,
   );
 };
 
-convexGateway.embeddingModel = function (modelId: string): EmbeddingModel {
+convexGateway.embeddingModel = function (
+  modelId: string,
+  options?: GatewayModelOptions,
+): EmbeddingModel {
   return wrapEmbeddingModel({
-    model: createGatewayProvider().embeddingModel(modelId),
+    model: createGatewayProvider((input, init) =>
+      gatewayModelFetch(modelId, input, init, options),
+    ).embeddingModel(modelId),
     middleware: {
       specificationVersion: "v4",
       overrideMaxEmbeddingsPerCall: () => maxEmbeddingsPerCall,
@@ -224,6 +253,30 @@ convexGateway.imageModel = function (modelId: string): ImageModel {
       };
     },
   };
+};
+
+/** Speech-to-text for the AI SDK's `experimental_transcribe`. */
+convexGateway.transcriptionModel = function (modelId: string) {
+  return createTranscriptionModel(
+    modelId,
+    gatewayBaseURL(),
+    gatewayFetch,
+    convexGatewayUsageMetadata,
+  );
+};
+
+/**
+ * Text-to-speech for the AI SDK's `experimental_generateSpeech`. The gateway
+ * reports speech cost after the call, so results carry no cost metadata.
+ */
+convexGateway.speechModel = function (modelId: string) {
+  const provider = createOpenAI({
+    name: "convexGateway.speech",
+    baseURL: gatewayBaseURL(),
+    apiKey: placeholderCredential,
+    fetch: (input, init) => gatewayModelFetch(modelId, input, init),
+  });
+  return provider.speech(modelId);
 };
 
 /** Video generation for the AI SDK's `experimental_generateVideo`. */

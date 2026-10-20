@@ -123,7 +123,6 @@ use crate::{
         write_persistence_global_timer,
         QueryIndexStats,
     },
-    ConnectError,
     ConvexMySqlPool,
     MySqlInstanceName,
     MySqlOptions,
@@ -132,7 +131,7 @@ use crate::{
 
 pub struct Persistence<RT: Runtime> {
     newly_created: AtomicBool,
-    pub(super) lease: Lease<RT>,
+    pub(crate) lease: Lease<RT>,
 
     // Used by the reader.
     pub(super) read_pool: Arc<ConvexMySqlPool<RT>>,
@@ -147,14 +146,16 @@ impl<RT: Runtime> Persistence<RT> {
         db_name: String,
         options: MySqlOptions,
         lease_lost_shutdown: ShutdownSignal,
-    ) -> Result<Self, ConnectError> {
+    ) -> anyhow::Result<Self> {
         if options.version != PersistenceVersion::V5 {
-            return Err(anyhow::anyhow!("V5 persistence cannot open a non-V5 database").into());
+            return Err(anyhow::anyhow!(
+                "V5 persistence cannot open a non-V5 database"
+            ));
         }
         let expected_table_count = super::EXPECTED_TABLE_COUNT;
         let init_sql = super::init_sql(options.multitenant);
         let init_lease = super::init_lease(options.multitenant);
-        let newly_created = {
+        {
             let mut client = pool.acquire("init_sql", &db_name).await?;
             let table_count: usize = client
                 .query_optional(super::GET_TABLE_COUNT, vec![(&db_name).into()])
@@ -181,24 +182,22 @@ impl<RT: Runtime> Persistence<RT> {
                     },
                 )
                 .await?;
-            Self::check_newly_created(&mut client, options.multitenant, &options.instance_name)
-                .await?
         };
-        let mut client = pool.acquire("read_only", &db_name).await?;
-        if !options.allow_read_only
-            && Self::is_read_only(&mut client, options.multitenant, &options.instance_name).await?
-        {
-            return Err(ConnectError::ReadOnly);
-        }
 
         let lease = Lease::acquire(
             pool.clone(),
             db_name.clone(),
             options.instance_name.clone(),
             options.multitenant,
+            options.allow_read_only,
             lease_lost_shutdown,
         )
         .await?;
+        let newly_created = {
+            let mut client = pool.acquire("check_newly_created", &db_name).await?;
+            Self::check_newly_created(&mut client, options.multitenant, &options.instance_name)
+                .await?
+        };
         Ok(Self {
             newly_created: newly_created.into(),
             lease,
@@ -250,21 +249,6 @@ impl<RT: Runtime> Persistence<RT> {
         }
     }
 
-    async fn is_read_only(
-        client: &mut MySqlConnection<'_, RT>,
-        multitenant: bool,
-        instance_name: &MySqlInstanceName,
-    ) -> anyhow::Result<bool> {
-        let mut params = vec![];
-        if multitenant {
-            params.push((&instance_name.raw).into());
-        }
-        Ok(client
-            .query_optional(super::check_is_read_only(multitenant), params)
-            .await?
-            .is_some())
-    }
-
     async fn check_newly_created(
         client: &mut MySqlConnection<'_, RT>,
         multitenant: bool,
@@ -280,38 +264,19 @@ impl<RT: Runtime> Persistence<RT> {
             .is_none())
     }
 
-}
-
-#[async_trait]
-impl<RT: Runtime> IndexRowPersistence for Persistence<RT> {
-    async fn delete_index_rows(&self, expired_entries: Vec<IndexEntry>) -> anyhow::Result<usize> {
-        super::indexes::delete_index_rows(self, expired_entries).await
-    }
-}
-
-#[async_trait]
-impl<RT: Runtime> PersistenceTrait for Persistence<RT> {
-    fn is_fresh(&self) -> bool {
-        self.newly_created.load(SeqCst)
-    }
-
-    fn reader(&self) -> Arc<dyn PersistenceReader> {
-        Arc::new(Reader {
-            db_name: self.db_name.clone(),
-            read_pool: self.read_pool.clone(),
-            db_should_be_leader: true,
-            instance_name: self.instance_name.clone(),
-            multitenant: self.multitenant,
-        })
-    }
-
+    /// Runs `f` in the transaction that writes the V5 rows, so an error from
+    /// either rolls back the other's writes as well.
     #[fastrace::trace]
-    async fn write<'a>(
+    pub(crate) async fn write_in_transaction<'a, F>(
         &self,
         documents: &'a [DocumentLogEntry],
         indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
-    ) -> anyhow::Result<()> {
+        f: F,
+    ) -> anyhow::Result<()>
+    where
+        F: for<'tx> AsyncFnOnce(&'tx mut MySqlTransaction<'_>) -> anyhow::Result<()>,
+    {
         anyhow::ensure!(documents.len() <= crate::MAX_INSERT_SIZE);
         let mut write_size = 0;
         for update in documents {
@@ -427,8 +392,42 @@ impl<RT: Runtime> PersistenceTrait for Persistence<RT> {
                         )
                         .await?;
                 }
-                Ok(())
+                f(tx).await
             })
+            .await
+    }
+}
+
+#[async_trait]
+impl<RT: Runtime> IndexRowPersistence for Persistence<RT> {
+    async fn delete_index_rows(&self, expired_entries: Vec<IndexEntry>) -> anyhow::Result<usize> {
+        super::indexes::delete_index_rows(self, expired_entries).await
+    }
+}
+
+#[async_trait]
+impl<RT: Runtime> PersistenceTrait for Persistence<RT> {
+    fn is_fresh(&self) -> bool {
+        self.newly_created.load(SeqCst)
+    }
+
+    fn reader(&self) -> Arc<dyn PersistenceReader> {
+        Arc::new(Reader {
+            db_name: self.db_name.clone(),
+            read_pool: self.read_pool.clone(),
+            db_should_be_leader: true,
+            instance_name: self.instance_name.clone(),
+            multitenant: self.multitenant,
+        })
+    }
+
+    async fn write<'a>(
+        &self,
+        documents: &'a [DocumentLogEntry],
+        indexes: &'a [PersistenceIndexEntry],
+        conflict_strategy: ConflictStrategy,
+    ) -> anyhow::Result<()> {
+        self.write_in_transaction(documents, indexes, conflict_strategy, async |_| Ok(()))
             .await
     }
 
@@ -1492,7 +1491,7 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
 /// The only thing a `Lease` can do is execute a transaction against the
 /// database and atomically ensure that the lease was still held during the
 /// transaction, and otherwise return a lease lost.
-pub(super) struct Lease<RT: Runtime> {
+pub(crate) struct Lease<RT: Runtime> {
     pool: Arc<ConvexMySqlPool<RT>>,
     db_name: String,
     instance_name: MySqlInstanceName,
@@ -1502,6 +1501,46 @@ pub(super) struct Lease<RT: Runtime> {
 }
 
 impl<RT: Runtime> Lease<RT> {
+    #[allow(
+        dead_code,
+        reason = "Consumed by the opt-in shadow implementation in the follow-up PR"
+    )]
+    pub(crate) fn pool(&self) -> &Arc<ConvexMySqlPool<RT>> {
+        &self.pool
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Consumed by the opt-in shadow implementation in the follow-up PR"
+    )]
+    pub(crate) fn db_name(&self) -> &str {
+        &self.db_name
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Consumed by the opt-in shadow implementation in the follow-up PR"
+    )]
+    pub(crate) fn multitenant(&self) -> bool {
+        self.multitenant
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Consumed by the opt-in shadow implementation in the follow-up PR"
+    )]
+    pub(crate) fn timestamp(&self) -> i64 {
+        self.lease_ts
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Consumed by the opt-in shadow implementation in the follow-up PR"
+    )]
+    pub(crate) fn instance_name(&self) -> &str {
+        &self.instance_name.raw
+    }
+
     /// Acquire a lease. Makes other lease-holders get `LeaseLostError` when
     /// they commit.
     async fn acquire(
@@ -1509,6 +1548,7 @@ impl<RT: Runtime> Lease<RT> {
         db_name: String,
         instance_name: MySqlInstanceName,
         multitenant: bool,
+        allow_read_only: bool,
         lease_lost_shutdown: ShutdownSignal,
     ) -> anyhow::Result<Self> {
         let timer = metrics::lease_acquire_timer(pool.cluster_name());
@@ -1522,13 +1562,16 @@ impl<RT: Runtime> Lease<RT> {
         let mut params = vec![ts.into(), ts.into()];
         if multitenant {
             params.push((&instance_name.raw).into());
+            if !allow_read_only {
+                params.push((&instance_name.raw).into());
+            }
         }
         let rows_modified = client
-            .exec_iter(super::lease_acquire(multitenant), params)
+            .exec_iter(super::lease_acquire(multitenant, allow_read_only), params)
             .await?;
         anyhow::ensure!(
             rows_modified == 1,
-            "failed to acquire lease: Already acquired with higher timestamp"
+            "failed to acquire lease: already acquired with higher timestamp, or read-only"
         );
         tracing::info!("lease acquired with ts {}", ts);
 
@@ -1552,7 +1595,7 @@ impl<RT: Runtime> Lease<RT> {
     /// might've been made to the database state while the lease was not
     /// held.
     #[fastrace::trace]
-    pub(super) async fn transact<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn transact<F, T>(&self, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
@@ -1564,7 +1607,7 @@ impl<RT: Runtime> Lease<RT> {
     /// this so their DELETEs take only record locks, sparing concurrent index
     /// writers the next-key/gap locks REPEATABLE READ adds.
     #[fastrace::trace]
-    pub(super) async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {

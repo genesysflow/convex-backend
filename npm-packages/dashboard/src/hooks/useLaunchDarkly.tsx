@@ -12,6 +12,8 @@ export const flagDefaults: {
   s3ExportIntegration: boolean;
   showFivetranSyncProgress: boolean;
   supportTicketForAllPlans: boolean;
+  healthDeployProgress: boolean;
+  componentSwitcherTreeEnabled: boolean;
 } = {
   commandPaletteDeleteProjects: false,
   enableNewDashboardVersionNotification: false,
@@ -23,6 +25,8 @@ export const flagDefaults: {
   s3ExportIntegration: false,
   showFivetranSyncProgress: false,
   supportTicketForAllPlans: false,
+  healthDeployProgress: false,
+  componentSwitcherTreeEnabled: false,
 };
 
 export const flagDefaultsKebabCase = Object.entries(flagDefaults).reduce(

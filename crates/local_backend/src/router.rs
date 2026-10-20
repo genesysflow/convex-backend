@@ -46,7 +46,6 @@ use tower_http::{
     },
     decompression::RequestDecompressionLayer,
 };
-use udf::HTTP_ACTION_BODY_LIMIT;
 use utoipa::{
     openapi::security::{
         ApiKey,
@@ -83,6 +82,7 @@ use crate::{
         push_config,
     },
     deploy_config2,
+    deployment_jwks::deployment_jwks,
     environment_variables::{
         list_environment_variables,
         platform_router,
@@ -426,6 +426,7 @@ pub fn router(st: LocalAppState) -> Router {
     Router::new()
         .nest("/api", api_routes)
         .merge(health_check_routes(version))
+        .route("/.well-known/jwks.json", get(deployment_jwks))
         .layer(cors())
         .with_state(st)
         .merge(migrated)
@@ -495,7 +496,6 @@ pub fn http_action_routes() -> Router<RouterState> {
     Router::new()
         .route("/{*rest}", http_action_handler())
         .route("/", http_action_handler())
-        .layer(DefaultBodyLimit::max(HTTP_ACTION_BODY_LIMIT))
 }
 
 pub fn app_metrics_routes<S>() -> Router<S>

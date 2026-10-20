@@ -171,12 +171,12 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
     ) -> anyhow::Result<()> {
         let doc = self.must_get_including_tombstoned(id).await?;
         if let (SinkConfig::S3Export(old), SinkConfig::S3Export(new)) = (&doc.config, &mut config) {
-            if old.bucket == new.bucket && old.prefix == new.prefix {
-                new.cursor = old.cursor.clone();
-                new.progress = old.progress.clone();
-            } else {
+            if old.requires_resync(new) {
                 new.cursor = None;
                 new.progress = None;
+            } else {
+                new.cursor = old.cursor.clone();
+                new.progress = old.progress.clone();
             }
         }
         SystemMetadataModel::new_global(self.tx)
@@ -228,6 +228,17 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
             config,
         };
 
+        let existing = self.get_by_provider(sink_type.clone()).await?;
+        // Check within the insert transaction so concurrent creates cannot
+        // replace an export and discard its cursor.
+        anyhow::ensure!(
+            existing.is_none() || sink_type != SinkType::S3Export,
+            ErrorMetadata::conflict(
+                "LogStreamAlreadyExists",
+                "An S3 export already exists. Delete it before creating a new one.",
+            )
+        );
+
         // Filter to non-tombstoned log sinks
         let sinks = self
             .get_all()
@@ -243,7 +254,7 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
             .into());
         }
 
-        if let Some(row) = self.get_by_provider(sink_type.clone()).await? {
+        if let Some(row) = existing {
             self.mark_for_removal(row.developer_id()).await?;
         }
 

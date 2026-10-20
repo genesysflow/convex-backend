@@ -30,7 +30,13 @@ use common::{
         LogEventFormatVersion,
         LogTopic,
     },
-    types::streaming_export::selection::Selection,
+    types::streaming_export::selection::{
+        ColumnSelection,
+        ComponentSelection,
+        InclusionDefault,
+        Selection,
+        TableSelection,
+    },
 };
 use errors::ErrorMetadata;
 use http::StatusCode;
@@ -442,6 +448,63 @@ impl TryFrom<CreatePostHogErrorTrackingLogStreamArgs> for PostHogErrorTrackingCo
 const S3_RESERVED_BUCKET_PREFIXES: [&str; 2] = ["xn--", "sthree-"];
 const S3_RESERVED_BUCKET_SUFFIXES: [&str; 2] = ["-s3alias", "--ol-s3"];
 
+// Changing field filters would require re-exporting documents that the cursor
+// has already passed. Table selection changes are handled by the iterator.
+fn validate_s3_selection(selection: &Selection) -> anyhow::Result<()> {
+    let filters_fields = selection
+        .components
+        .values()
+        .any(|component| match component {
+            ComponentSelection::Included { tables, .. } => tables.values().any(|table| {
+                matches!(table, TableSelection::Included { columns, other_columns }
+                if *other_columns == InclusionDefault::Excluded
+                    || columns.values().any(|c| *c == ColumnSelection::Excluded))
+            }),
+            ComponentSelection::Excluded(_) => false,
+        });
+    anyhow::ensure!(
+        !filters_fields,
+        ErrorMetadata::bad_request(
+            "FieldFiltersUnsupported",
+            "S3 exports can't filter fields within a table yet. Select whole tables instead.",
+        )
+    );
+    Ok(())
+}
+
+// Resuming a cursor in a different destination would skip all previously
+// exported pages. `/` and `None` address the same S3 directory, so an update
+// that only respells the prefix keeps the stored one.
+fn ensure_same_s3_destination(
+    existing: &S3ExportConfig,
+    updated: S3ExportConfig,
+) -> anyhow::Result<S3ExportConfig> {
+    let trimmed = |prefix: &Option<String>| {
+        prefix
+            .as_deref()
+            .unwrap_or_default()
+            .trim_matches('/')
+            .to_owned()
+    };
+    let updated = if trimmed(&existing.prefix) == trimmed(&updated.prefix) {
+        S3ExportConfig {
+            prefix: existing.prefix.clone(),
+            ..updated
+        }
+    } else {
+        updated
+    };
+    anyhow::ensure!(
+        !existing.requires_resync(&updated),
+        ErrorMetadata::bad_request(
+            "S3ExportDestinationChanged",
+            "An S3 export's bucket, region, prefix, and access key ID can't change. Delete the \
+             export and create a new one instead.",
+        )
+    );
+    Ok(updated)
+}
+
 fn validate_s3_bucket(bucket: &str) -> anyhow::Result<()> {
     // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
     let is_lower_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
@@ -480,7 +543,8 @@ pub struct CreateS3ExportLogStreamArgs {
     prefix: Option<String>,
     access_key_id: String,
     secret_access_key: String,
-    /// The components, tables, and columns to mirror. Defaults to everything.
+    /// The components and tables to export. Defaults to everything. Each table
+    /// exports whole documents, so filtering fields within a table is rejected.
     #[serde(default)]
     selection: Option<Selection>,
     /// How often the mirror is refreshed.
@@ -492,13 +556,15 @@ impl TryFrom<CreateS3ExportLogStreamArgs> for S3ExportConfig {
 
     fn try_from(value: CreateS3ExportLogStreamArgs) -> Result<Self, Self::Error> {
         validate_s3_bucket(&value.bucket)?;
+        let selection = value.selection.unwrap_or_default();
+        validate_s3_selection(&selection)?;
         Ok(Self {
             bucket: value.bucket,
             region: value.region,
             prefix: value.prefix,
             access_key_id: value.access_key_id.into(),
             secret_access_key: value.secret_access_key.into(),
-            selection: value.selection.unwrap_or_default(),
+            selection,
             period: value.period,
             cursor: None,
             progress: None,
@@ -603,6 +669,9 @@ pub async fn create_log_stream(
     Json(args): Json<CreateLogStreamArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
+    if matches!(&args, CreateLogStreamArgs::S3Export(_)) {
+        identity.require_operation(keybroker::DeploymentOp::ViewData)?;
+    }
     ensure_integration_allowed(&st.application, &identity, &args.sink_type()).await?;
 
     match args {
@@ -959,7 +1028,7 @@ pub struct S3ExportLogStreamConfig {
     /// AWS access key ID used to write to the bucket. The matching secret
     /// access key is write-only and is never returned.
     pub access_key_id: String,
-    /// The components, tables, and columns being mirrored.
+    /// The components and tables being exported.
     pub selection: Selection,
     /// How often the mirror is refreshed.
     pub period: SyncPeriod,
@@ -1219,7 +1288,8 @@ pub struct UpdateS3ExportSinkArgs {
     access_key_id: Option<String>,
     #[serde(default)]
     secret_access_key: Option<String>,
-    /// The components, tables, and columns to mirror.
+    /// The components and tables to export. Each table exports whole
+    /// documents, so filtering fields within a table is rejected.
     #[serde(default)]
     selection: Option<Selection>,
     /// How often the mirror is refreshed.
@@ -1278,6 +1348,9 @@ pub async fn update_log_stream(
         config: sink_config,
         ..
     } = st.application.must_get_log_sink_by_id(&id).await?;
+    if matches!(&sink_config, SinkConfig::S3Export(_)) {
+        identity.require_operation(keybroker::DeploymentOp::ViewData)?;
+    }
     ensure_integration_allowed(&st.application, &identity, &sink_config.sink_type()).await?;
 
     match sink_config {
@@ -1521,26 +1594,29 @@ pub async fn update_log_stream(
                 .into());
             };
 
-            let bucket = update_args.bucket.unwrap_or(existing_config.bucket);
-            validate_s3_bucket(&bucket)?;
-
+            if let Some(selection) = &update_args.selection {
+                validate_s3_selection(selection)?;
+            }
             let config = S3ExportConfig {
-                bucket,
-                region: update_args.region.unwrap_or(existing_config.region),
-                prefix: update_args.prefix.unwrap_or(existing_config.prefix),
+                bucket: update_args.bucket.unwrap_or(existing_config.bucket.clone()),
+                region: update_args.region.unwrap_or(existing_config.region.clone()),
+                prefix: update_args.prefix.unwrap_or(existing_config.prefix.clone()),
                 access_key_id: update_args
                     .access_key_id
                     .map(|k| k.into())
-                    .unwrap_or(existing_config.access_key_id),
+                    .unwrap_or(existing_config.access_key_id.clone()),
                 secret_access_key: update_args
                     .secret_access_key
                     .map(|k| k.into())
-                    .unwrap_or(existing_config.secret_access_key),
-                selection: update_args.selection.unwrap_or(existing_config.selection),
+                    .unwrap_or(existing_config.secret_access_key.clone()),
+                selection: update_args
+                    .selection
+                    .unwrap_or(existing_config.selection.clone()),
                 period: update_args.period.unwrap_or(existing_config.period),
                 cursor: None,
                 progress: None,
             };
+            let config = ensure_same_s3_destination(&existing_config, config)?;
 
             st.application
                 .patch_log_sink_config(
